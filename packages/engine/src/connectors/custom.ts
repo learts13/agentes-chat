@@ -740,7 +740,7 @@ export async function syncCustomTools(deps: CustomDeps, c: ConnectorConnection) 
         ...suggestion,
         access: null,
         label: humanize(tool.name).slice(0, 120),
-      });
+      }).onConflictDoNothing();
     }
   }
   const gone = existing.filter((t) => !seen.has(t.name) && !t.removedAt).map((t) => t.id);
