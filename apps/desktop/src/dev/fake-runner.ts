@@ -221,7 +221,7 @@ const SIGN_IN_POOL: (() => FakeOrgSeed)[] = [
   () => joinedSeed({ id: `org_${rid()}`, name: "Estúdio Norte" }),
 ];
 
-const DEFAULT_CONFIG = { maxConcurrentTasks: 3, taskMaxSeconds: 4 * 3600, brainIdleMinutes: 3, brainMaxProcesses: 1 };
+const DEFAULT_CONFIG = { maxConcurrentTasks: 3, taskMaxSeconds: 4 * 3600, brainIdleMinutes: 30, brainMaxProcesses: 1 };
 
 export class FakeRunner {
   private seed: FakeOrgSeed | null;
@@ -281,6 +281,8 @@ export class FakeRunner {
   /** The Mac's side of an iPhone's setup; `iphone.download` fills the platform in about a second. */
   /** How many times the iPhone setup asked to look at the iPhone again (`iphone.look`). */
   looks = 0;
+  /** The iPhones whose test helper the window asked to repair. */
+  repairs: string[] = [];
   iphone: ControlIphoneSetup = {
     xcode: "27.0",
     platform: { state: "missing" },
@@ -541,6 +543,9 @@ export class FakeRunner {
       case "iphone.look":
         this.looks++;
         return reply({ looking: true });
+      case "iphone.repair":
+        this.repairs.push(msg.serial);
+        return reply({ repairing: true });
       case "shutdown":
         return reply({ stopping: true });
     }

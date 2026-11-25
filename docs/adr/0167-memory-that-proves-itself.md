@@ -144,3 +144,10 @@ still matches word for word, and keys cover only the languages written and only 
 Checked offline: 24 made-up memories, Portuguese requests for English ones and the reverse, among lookalikes that
 share their words, with a fake model that gives a translation its original's vector: every one is in the top 5 of
 the hybrid ranking, almost none by words alone. A real model is checked in production.
+
+## Addendum (2026-11-24): a quote is never promoted
+
+A person's exact words kept as a memory (`quote` evidence, up to 2,000 characters of their message) were high trust and
+verified, so the nightly promotion pasted them whole as one bullet of an agent's instructions. `isPromotable` now skips
+quotes: they stay memory, read with the agent's title. It also skips an agent's facts (`kind = 'fact'` with an
+`agent_id`): a fact about the work is memory, not how the agent behaves. Workspace facts still go to the org context.

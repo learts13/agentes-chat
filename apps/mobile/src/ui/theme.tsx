@@ -1,9 +1,19 @@
 import { durations, motion as motionCurves, radius as radii, type ShadowLayer } from "@agenteschat/tokens";
-import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { isAccentHex } from "@agenteschat/tokens/accent";
+import {
+  createContext,
+  type ReactNode,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useState,
+} from "react";
 import { AccessibilityInfo, Platform, useColorScheme } from "react-native";
 import { Easing } from "react-native-reanimated";
 import { readValue, STORED, writeValue } from "@/lib/storage";
-import { type AppColors, appColors, appShadows, type Scheme } from "./palette";
+import { type AppColors, appColors, appShadows, paintSky, type Scheme, skyAccent, withAccent } from "./palette";
 
 /**
  * The theme for React Native, from `@agenteschat/tokens` (tokens.css is the source of truth), with the light
@@ -56,6 +66,13 @@ export const motion = {
   sheet: { duration: 300, dampingRatio: 0.8 },
   /** A small overshoot (the notice island's shape). */
   pop: { damping: 13, stiffness: 260, mass: 0.7 },
+  /**
+   * What moves to a new place (a row that reorders, a section under one that closes): settles with no overshoot, and
+   * a finger can interrupt it. In damping and stiffness, for `LinearTransition.springify()`.
+   */
+  nav: { damping: 30, stiffness: 260, mass: 1 },
+  /** A celebration (a face that hops, a pixel that pops): one clear overshoot. Rare. */
+  bounce: { damping: 15, stiffness: 240, mass: 1 },
 } as const;
 
 export interface Theme {
@@ -119,6 +136,23 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 export function ThemeColorsOverride({ colors, children }: { colors: AppColors; children: ReactNode }) {
   const theme = useTheme();
   const value = useMemo(() => ({ ...theme, colors }), [theme, colors]);
+  return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
+}
+
+/**
+ * The active workspace's accent (ADR 0193) on the agent colors of everything under it, and as the engine's `sky`: the
+ * color of every agent with none of its own and of the sky art. None: the theme's own.
+ */
+export function AccentProvider({ accent, children }: { accent: string | null | undefined; children: ReactNode }) {
+  const theme = useTheme();
+  const color = isAccentHex(accent) ? accent.toLowerCase() : null;
+  // Before the screens under it render (its effects run after theirs). Idempotent; the effect keeps it and clears it.
+  if (skyAccent() !== color) paintSky(color);
+  useLayoutEffect(() => {
+    paintSky(color);
+    return () => paintSky(null);
+  }, [color]);
+  const value = useMemo(() => ({ ...theme, colors: withAccent(theme.colors, theme.scheme, color) }), [theme, color]);
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
 }
 

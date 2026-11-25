@@ -14,6 +14,8 @@ import {
   insertMessage,
   isHowTo,
   isPlaybook,
+  isPromotable,
+  isQuote,
   LEARNED_EXPIRE_DAYS,
   learnRun,
   learnTrust,
@@ -22,6 +24,7 @@ import {
   normalizeSubject,
   openPersonAgentDm,
   postPersonMessage,
+  proposeFromItem,
   recordContextUse,
   retrieveForRun,
   SKILL_MIN_SPREAD,
@@ -472,6 +475,42 @@ describe("agents learn on their own (ADR 0120)", () => {
     expect(await f.db.select().from(schema.skills)).toEqual([]);
   });
 
+  test("a person's long message kept after outside content stays memory: never pasted into the agent's instructions", async () => {
+    f = await setup();
+    const long = `@dev ${"Prefiro as notas de reunião em tópicos curtos, sempre com o próximo passo no fim. ".repeat(60)}`;
+    const { run } = await personRun(long);
+    await step(run, "read_issue", { id: "1" }, '<external_data untrusted="true">Release notes</external_data>');
+    await invoke(run, "remember", {
+      kind: "preference",
+      title: "Short meeting notes",
+      content: "Wants meeting notes as short bullets ending with the next step.",
+      basis: "person_said",
+    });
+    await invoke(run, "remember", {
+      kind: "fact",
+      title: "Release day: Thursday",
+      content: "Releases go out on Thursdays.",
+      basis: "person_said",
+    });
+    const kept = await items();
+    expect(kept.map((i) => [i.trust, i.verified, isQuote(i)])).toEqual([
+      ["high", true, true],
+      ["high", true, true],
+    ]);
+    for (const item of kept) {
+      const strong = { ...item, recurrence: 5, confidence: 1, relevance: 1 };
+      expect(isPromotable(strong)).toBe(false);
+      expect(await proposeFromItem(f, strong)).toBeNull();
+    }
+    // An agent's fact in its own words is memory too; the workspace's still goes to its context.
+    const fact = { ...(kept[0] as (typeof kept)[number]), evidence: [], kind: "fact" as const, recurrence: 5 };
+    expect(isPromotable({ ...fact, evidence: [{ type: "human" as const, ref: "m", at: "" }] })).toBe(false);
+    expect(isPromotable({ ...fact, agentId: null, evidence: [{ type: "human" as const, ref: "m", at: "" }] })).toBe(
+      true,
+    );
+    expect(await f.db.select().from(schema.contextProposals)).toEqual([]);
+  });
+
   test("who holds which access becomes a workspace fact every agent reads, from a browser run too, kept current", async () => {
     f = await setup();
     const ops = await createAgent(
@@ -575,6 +614,16 @@ describe("agents learn on their own (ADR 0120)", () => {
     for (const part of ["port 2222", "as deploy", "~/.ssh/vps_example"]) expect(saved[0]?.content).toContain(part);
   });
 
+  test("notes follow the language of the person the turn was for, never an example's Portuguese", async () => {
+    f = await setup();
+    await f.db.update(schema.users).set({ locale: "en" }).where(eq(schema.users.id, f.owner.id));
+    const { run } = await personRun("@dev check the deploy");
+    await learnRun(f.context, { orgId: f.org.id, runId: run.id });
+    const call = f.provider.calls.find((c) => isLearn(systemText(c.request.system)));
+    expect(systemText(call?.request.system ?? "")).not.toContain("Como gravar");
+    expect(JSON.stringify(call?.request.messages)).toContain("App language of the person this turn was for: en");
+  });
+
   test("guards: daily cap, a live run, credentials, a person's item, update_skill rules, a run that saved already", async () => {
     f = await setup();
     const today = new Date().toISOString().slice(0, 10);
@@ -659,7 +708,7 @@ describe("agents learn on their own (ADR 0120)", () => {
     ]);
 
     // update_skill: only after load_skill in the run, never a locked skill or another agent's; a person's skill
-    // changes at once while agents improve skills by themselves (the default), else it becomes a proposal.
+    // changes at once while agents improve skills by themselves (the default), else agents leave it alone.
     const skill = async (slug: string, extra: Partial<typeof schema.skills.$inferInsert> = {}) => {
       const [s] = await f.db
         .insert(schema.skills)
@@ -686,17 +735,13 @@ describe("agents learn on their own (ADR 0120)", () => {
     const member = await addMember(f.db, f.org.id, "member");
     const { run: memberRun } = await personRun("@dev fix the handbook", false, undefined, member.id);
     await step(memberRun, "load_skill", { name: "handbook" }, "loaded");
-    const proposed = await invoke(memberRun, "update_skill", {
+    const refused = await invoke(memberRun, "update_skill", {
       name: "handbook",
       body: "# handbook\n1. Another step.",
     });
-    expect(proposed.content).toContain("Agents don't change this skill by themselves here");
-    const [proposal] = await f.db.select().from(schema.contextProposals);
-    expect([proposal?.target, proposal?.access?.[0]?.label, proposal?.proposedText]).toEqual([
-      "skill",
-      "handbook",
-      "# handbook\n1. Another step.",
-    ]);
+    expect(refused).toMatchObject({ isError: true });
+    expect(refused.content).toContain("Agents don't change this skill on their own");
+    expect(await f.db.select().from(schema.contextProposals)).toEqual([]);
     expect(
       (await receipts()).filter((r) => r.kind === "skill.updated").map((r) => (r.before as { body: string }).body),
     ).toEqual(["# mine", "# handbook"]);

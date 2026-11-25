@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { GROK_PROTOCOL, LOCKED_BRAIN_PROTOCOL, SHARED_GROK_PROTOCOL } from "@agenteschat/adapters";
+import {
+  GROK_PROTOCOL,
+  GROK_WINDOWS_PROTOCOL,
+  LOCKED_BRAIN_PROTOCOL,
+  SHARED_GROK_PROTOCOL,
+} from "@agenteschat/adapters";
 import { GROK_BUILD_MODELS, loginPerAgent, sharedSignIn } from "@agenteschat/providers/plans";
 import { brainOptions, defaultBrainModel, grokModels, isBrainKind } from "../src/brain-settings";
 import { type BrainTurnRequest, type ComputerBrainLink, GrokBrain } from "../src/brains/codex";
@@ -28,6 +33,7 @@ const turn = (over: Partial<BrainTurn> = {}): BrainTurn => ({
 });
 
 function link(opts: {
+  os?: string;
   protocol?: number;
   grok?: boolean;
   tools?: { claude: boolean; codex: boolean; grok?: boolean; commands: boolean };
@@ -41,6 +47,7 @@ function link(opts: {
         online: true,
         execAllowed: true,
         protocol: opts.protocol ?? GROK_PROTOCOL,
+        ...(opts.os ? { os: opts.os } : {}),
         executors: opts.grok === false ? {} : { grok: { version: "grok 1.0.34 (3736acbc8658) [stable]" } },
         ...(opts.tools ? { access: { tools: opts.tools } } : {}),
       };
@@ -170,4 +177,22 @@ test("the right hand's reply never carries an xAI key", () => {
   );
   expect(out.text).not.toContain("xai-");
   expect(out.found).toBeGreaterThan(0);
+});
+
+test("a Grok turn on a Windows computer reaches its runner from `GROK_WINDOWS_PROTOCOL` on, like Linux and macOS", async () => {
+  // An older Windows runner is refused as too old (brain-codex.test.ts), never as its system's.
+  for (const [os, protocol] of [
+    ["windows", GROK_WINDOWS_PROTOCOL],
+    ["linux", undefined],
+    ["darwin", undefined],
+    [undefined, undefined],
+  ] as const) {
+    const l = link({
+      ...(os ? { os } : {}),
+      ...(protocol ? { protocol } : {}),
+      events: [{ type: "done", text: "ok", session: { id: "s" } }],
+    });
+    await collect(brain(l).run(turn(), io()));
+    expect(l.sent).toHaveLength(1);
+  }
 });

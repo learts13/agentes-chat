@@ -1,5 +1,12 @@
 import type { RunStatus } from "@agenteschat/client/lib/calendar";
-import { AGENT_GRADIENTS, type AgentColorName, bodyTones, mixHex, spriteGrid } from "@agenteschat/ui/agent/engine";
+import {
+  AGENT_GRADIENTS,
+  type AgentColorName,
+  bodyTones,
+  mixHex,
+  type SkyPair,
+  spriteGrid,
+} from "@agenteschat/ui/agent/engine";
 import { CellGrid, type CellRun, column } from "../browser/trail-pixels";
 
 /**
@@ -108,6 +115,20 @@ export function stripCells(
   return out.runs();
 }
 
+/**
+ * The run a finger picked at `x` points across a strip of `slots` (`stripCells`): the nearest drawn run's index in the
+ * runs (newest first), `-1` for the run in progress, null with none drawn. A finger is wider than a column, so a tap
+ * between columns or on the empty dots still lands on the nearest run.
+ */
+export function stripRunAt(x: number, count: number, slots: number, running: boolean): number | null {
+  const shown = Math.min(count, slots - (running ? 1 : 0));
+  const drawn = shown + (running ? 1 : 0);
+  if (drawn === 0) return null;
+  const slot = Math.floor(x / ((COLUMN_W + COLUMN_GAP) * RUN_CELL));
+  const k = Math.min(drawn - 1, Math.max(0, slot - (slots - drawn)));
+  return running && k === drawn - 1 ? -1 : shown - 1 - k;
+}
+
 // ── A lane of the horizon ───────────────────────────────────────────────────
 
 /** A lane's height in cells, and the row its line sits on. */
@@ -178,7 +199,12 @@ export function spritePose(
 }
 
 /** The agent as a 9×9 sprite: its body dithered in its tones, its eyes (writing while it runs, or blinking). */
-export function spriteCells(color: AgentColorName, eyes: string, running: boolean, blink: boolean): CellRun[] {
+export function spriteCells(
+  color: AgentColorName | SkyPair,
+  eyes: string,
+  running: boolean,
+  blink: boolean,
+): CellRun[] {
   const tones = bodyTones(color);
   const out = new CellGrid();
   spriteGrid(SPRITE, eyes).forEach((row, y) => {

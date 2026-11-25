@@ -1742,6 +1742,36 @@ test("limits and failures: short of memory, Xvnc that doesn't start, a computer 
   expect(await errorCode(() => bare.ensure(dev))).toBe("desktop_unavailable");
 });
 
+test("a second ensure while a start is under way gets that start's outcome, never a start of its own; each start is told", async () => {
+  const told: [string, unknown][] = [];
+  const t = setup({ onStarted: (agent, start) => told.push([agent.handle, start]) });
+  t.fake.failXvnc("(EE) Fatal server error: vncExtInit: Failed to bind socket");
+  // A viewer's retry, and another viewer, while the first open still starts it.
+  const tries = [t.desktops.ensure(dev), t.desktops.ensure(dev), t.desktops.ensure(dev)];
+  const outcomes = await Promise.all(
+    tries.map((p) =>
+      p.then(
+        () => "ok",
+        (err: RunnerError) => err.code,
+      ),
+    ),
+  );
+  expect(outcomes).toEqual(["internal", "internal", "internal"]);
+  expect(t.fake.of("Xtigervnc")).toHaveLength(1);
+  expect(told).toEqual([["dev", { ms: 0, error: "internal" }]]);
+
+  t.fake.failXvnc(null);
+  const [first, second] = await Promise.all([t.desktops.ensure(dev), t.desktops.ensure(dev)]);
+  expect(first).toEqual(second);
+  expect(first.started).toBe(true);
+  expect(t.fake.of("Xtigervnc")).toHaveLength(2);
+  expect(told[1]).toEqual(["dev", { ms: 0, steps: { room: 0, prepared: 0, screen: 0, look: 0, session: 0 } }]);
+  // Running: only marked used, with nothing to tell.
+  expect((await t.desktops.ensure(dev)).started).toBe(false);
+  expect(told).toHaveLength(2);
+  t.desktops.close();
+});
+
 test("requests: starting needs the desktop switch and an unpaused computer; stopping and asking always go", async () => {
   const t = setup();
   const ws = tempDir("desk-req-");

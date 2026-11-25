@@ -1,26 +1,35 @@
-import type { AiAccounts as AiAccountsView, Credential } from "@agenteschat/client";
+import type { AccountOrderGroup, AiAccounts as AiAccountsView, Credential } from "@agenteschat/client";
 import {
   keys,
+  useAccountOrder,
   useAiAccounts,
   useAiStatus,
   useApi,
   useCredentials,
   useMachines,
+  useMoveAccountInOrder,
   usePlatformKey,
   useSettings,
   useUpdateSettings,
 } from "@agenteschat/client";
 import {
+  accountSub,
   accountTitle,
+  againLogin,
   agentsToGive,
   endsOnClaude,
   identityUnknown,
   keyRemovalText,
+  newestUsage,
   offersSignInAgain,
   onSeveralComputers,
+  orderAccounts,
+  orderMover,
+  orderPlaces,
   ownSignIns,
   ownSignInTitle,
-  signInOf,
+  signInNote,
+  unnamedAccount,
 } from "@agenteschat/client/lib/ai-accounts";
 import { computerNameOf } from "@agenteschat/client/lib/computer";
 import { errorText, keyRefusal } from "@agenteschat/client/lib/errors";
@@ -34,7 +43,7 @@ import { keyCopiesLine, keyName, keyNamedAfterProvider, keySource, shownKeys } f
 import { isRightHand } from "@agenteschat/client/lib/right-hand";
 import { isPersonal } from "@agenteschat/client/lib/workspace-mode";
 import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Alert, RefreshControl, ScrollView, StyleSheet, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -45,6 +54,7 @@ import {
   GroupedHeader,
   GroupedList,
   GroupedRow,
+  InfoHint,
   Locked,
   ProviderLogo,
   SkeletonList,
@@ -61,9 +71,11 @@ import { errorHaptic, goBack, PushedHeader, successHaptic } from "../shared/part
 import { SheetHostProvider, useSheet } from "../shared/SheetHost";
 import { overLimit, TextArea } from "../shared/TextArea";
 import { PlanMeter } from "../usage/parts";
-import { openKeyForAll } from "./KeyForAllScreen";
+import { openKeyForAll } from "./AgentSetupScreen";
+import { HubList } from "./AiHubScreens";
+import { orderMoves, ownAccountRows } from "./logic";
 import { openConnectAi } from "./NoAiCard";
-import { alertKeyRefused, Note, PasteField, PlanHoldNote, usePlanHold } from "./parts";
+import { alertKeyRefused, Note, openRenameAiAccount, PasteField, PlanHoldNote, usePlanHold } from "./parts";
 
 /*
  * Contas de IA, as the web's Settings › Contas de IA (ADR 0059, ADR 0061), as the settings screens are: grouped lists
@@ -71,8 +83,9 @@ import { alertKeyRefused, Note, PasteField, PlanHoldNote, usePlanHold } from "./
  * connected ("Conta deste computador", the agents there think with them), then their own accounts on every computer,
  * each with its plan's meter and the agents it thinks for, renamed (on a screen of its own), signed in again (a new key
  * for a coding plan) on its plan's page of Connect an AI, given to one more agent where it thinks for all of them, or
- * disconnected here; "Conectar uma IA" ends the list (the same picker as everywhere). Then the workspace's API keys (admins), the
- * default one, a key swapped (in a sheet) or deleted, and "Adicionar chave" ending theirs.
+ * disconnected here. An account a run may move to at a limit sits instead in its plan's "Ordem de uso" (ADR 0041
+ * §6), numbered. "Conectar uma IA" comes after every account (the same picker as everywhere). Then the workspace's API
+ * keys (admins), the default one, a key swapped (in a sheet) or deleted, and "Adicionar chave" ending theirs.
  */
 
 type Account = AiAccountsView["accounts"][number];
@@ -103,15 +116,13 @@ function AiAccounts() {
   const computerOf = (name: string) => computerNameOf(t, org?.name ?? "", name, isPersonal(org));
   const api = useApi();
   const qc = useQueryClient();
-  const toast = useToast();
   const c = useColors();
   const insets = useSafeAreaInsets();
   const ai = useAiAccounts(orgId);
   const machines = useMachines(orgId);
-  const dir = useDirectory();
-  const meId = useMeId();
   const status = useAiStatus(orgId);
   const hold = usePlanHold(orgId, org);
+  const order = useAccountOrder(orgId);
   // Looking at the plans: their usage is looked up again (it comes back as `machine.updated`).
   useEffect(() => {
     void api.machines.refreshAccountUsage(orgId).catch(() => undefined);
@@ -123,18 +134,229 @@ function AiAccounts() {
       ai.refetch(),
       machines.refetch(),
       status.refetch(),
+      order.refetch(),
       qc.invalidateQueries({ queryKey: keys.credentials(orgId) }),
     ]);
   });
-  const rows = ai.data?.accounts ?? [];
+  // The viewer's logins of one account (one per agent) are one row; disconnecting it removes every one of them.
+  const owned = ownAccountRows(ai.data?.accounts ?? []);
+  const rows = owned.map((o) => o.account);
+  const ownOf = (a: Account) => owned.find((o) => o.account.id === a.id) ?? { logins: [a], signedOut: [], unknown: [] };
   const own = ownSignIns(ai.data);
   const several = onSeveralComputers(rows);
+  const { actions, moves, moving } = useAccountActions(ownOf);
+  const names = (list: string[]) => joinNames(list, t);
+  const machineOf = (a: Account) => machines.data?.find((m) => m.id === a.machineId);
+  // An order of one account shows nothing of an order; an account signed in once per agent is one place in it.
+  const groups = (order.data?.groups ?? []).filter((g) => orderAccounts(g.accounts).length > 1);
+  const placed = new Set(groups.flatMap((g) => g.accounts.map((a) => a.id)));
+  const severalOrders = new Set(groups.map((g) => g.machineId)).size > 1;
+
+  /**
+   * One of the viewer's accounts: its meter and actions, with its place `n` when it is in an order (`g`), blank (null)
+   * when a run never moves to it.
+   */
+  const accountRow = (a: Account, g?: AccountOrderGroup, n?: number | null) => {
+    const plan = planOf(a.provider);
+    // Every login of the account: one agent's sign-in may have ended while the row goes by another's.
+    const note = signInNote(t, ownOf(a), Boolean(plan));
+    const off = ownOf(a).signedOut.length === ownOf(a).logins.length;
+    const facts = [
+      accountSub(a) ??
+        (a.keyHint
+          ? t("aiAccounts.page.keyEnds", { hint: a.keyHint })
+          : identityUnknown(a, machineOf(a))
+            ? t("aiAccounts.page.identityUnknown")
+            : null),
+      several ? t("aiAccounts.page.on", { computer: computerOf(a.computer) }) : null,
+      a.usedBy.length > 0
+        ? t("aiAccounts.page.usedBy", { count: a.usedBy.length, agents: names(a.usedBy) })
+        : t("aiAccounts.page.noAgent"),
+    ].filter(Boolean);
+    return (
+      <GroupedRow
+        key={a.id}
+        leading={
+          n !== undefined ? (
+            <Text variant="callout" tone="muted" style={styles.place}>
+              {n ?? ""}
+            </Text>
+          ) : (
+            <ProviderLogo id={a.provider ?? a.kind} size="sm" off={off} />
+          )
+        }
+        leadingSaid={n?.toString()}
+        label={accountTitle(t, a)}
+        faint={unnamedAccount(a)}
+        sub={facts.join(" · ")}
+        subLines={2}
+        more
+        disabled={g !== undefined && moving}
+        onPress={() => actions(a, g)}
+        below={
+          note || a.usage || (plan && !plan.usage) ? (
+            <View style={styles.below}>
+              {note ? <Note icon={note.state === "out" ? "x" : "info"}>{note.text}</Note> : null}
+              {a.usage ? (
+                <PlanMeter usage={a.usage} compact />
+              ) : plan && !plan.usage ? (
+                <Text variant="footnote" tone="faint">
+                  {t("aiAccounts.usage.notShared", { maker: plan.maker })}
+                </Text>
+              ) : null}
+            </View>
+          ) : undefined
+        }
+      />
+    );
+  };
+
+  // Under a hold its note says what comes first: an invitation to connect a plan would contradict it.
+  const hub = ai.data?.hub ?? null;
+  const none = !hold && ai.isSuccess && (hub ? hub.accounts.length : rows.length) === 0 && own.length === 0;
+  const adds = !none && !hold;
+  const connect =
+    adds && ai.isSuccess ? (
+      <GroupedRow icon="plus" label={t("aiAccounts.page.connect")} onPress={() => openConnectAi()} />
+    ) : null;
+  const ownRows = own.map((o) => (
+    <GroupedRow
+      key={o.key}
+      leading={<ProviderLogo id={o.kind} size="sm" />}
+      label={ownSignInTitle(t, o)}
+      sub={t("aiAccounts.page.ownOn", { computer: o.computer })}
+      below={
+        o.usage ? (
+          <View style={styles.below}>
+            <PlanMeter usage={o.usage} compact />
+          </View>
+        ) : undefined
+      }
+    />
+  ));
+  return (
+    <View style={[styles.screen, { backgroundColor: c.grouped }]}>
+      <PushedHeader
+        title={t(isPersonal(org) ? "settings.section.keysPersonal" : "mobile.ai.row")}
+        solid={false}
+        grouped
+      />
+      <ScrollView
+        contentInsetAdjustmentBehavior="automatic"
+        refreshControl={<RefreshControl refreshing={pull.refreshing} onRefresh={pull.onRefresh} />}
+        contentContainerStyle={[styles.in, { paddingBottom: insets.bottom + 24 }]}
+      >
+        {hub ? null : (
+          <GroupedHeader
+            hint={{ name: t("common.about", { label: t("aiAccounts.page.title") }), text: t("aiAccounts.page.hint") }}
+          >
+            {t("aiAccounts.page.title")}
+          </GroupedHeader>
+        )}
+        {ai.isLoading ? <SkeletonList rows={2} /> : null}
+        {ai.isError && !ai.data ? <LoadFailed onRetry={() => void ai.refetch()} /> : null}
+        {none ? (
+          <FirstUse place="ai" size="panel" acts label={t("aiAccounts.page.connect")} onPress={() => openConnectAi()} />
+        ) : null}
+        {hub ? (
+          <>
+            {hold ? <PlanHoldNote org={org} inset /> : null}
+            {none ? null : <HubList hub={hub} connect={adds && ai.isSuccess} before={ownRows} />}
+          </>
+        ) : (
+          <>
+            {/* One list, as Settings' own: the computers' sign-ins, the person's accounts not in an order, then the way to
+            one more, which follows the orders when there are any. The mark sits in the rows' leading column and the
+            hairlines start at the words. */}
+            <GroupedList>
+              {ownRows}
+              {rows.filter((a) => !placed.has(a.id)).map((a) => accountRow(a))}
+              {groups.length === 0 ? connect : null}
+            </GroupedList>
+            {hold ? <PlanHoldNote org={org} inset /> : null}
+            {groups.map((g) => (
+              <OrderSection
+                key={`${g.machineId}:${g.kind}`}
+                group={g}
+                computer={severalOrders ? computerOf(g.computer) : null}
+              >
+                {orderAccounts(g.accounts).map((block, i) => {
+                  const a = block.find((l) => rows.some((r) => r.id === l.id)) ?? block[0];
+                  if (!a) return null;
+                  const n = orderPlaces(g.accounts)[i] ?? null;
+                  const mine = rows.find((r) => r.id === a.id);
+                  if (mine) return accountRow(mine, g, n);
+                  const them = moves(g, a);
+                  const usage = newestUsage(block);
+                  return (
+                    <GroupedRow
+                      key={a.id}
+                      leading={
+                        <Text variant="callout" tone="muted" style={styles.place}>
+                          {n ?? ""}
+                        </Text>
+                      }
+                      leadingSaid={n?.toString()}
+                      label={accountTitle(t, a)}
+                      sub={a.ownerName ?? undefined}
+                      more={them.length > 0}
+                      disabled={moving}
+                      {...(them.length > 0
+                        ? { onPress: () => choose(accountTitle(t, a), them, t("common.cancel")) }
+                        : {})}
+                      below={
+                        usage ? (
+                          <View style={styles.below}>
+                            <PlanMeter usage={usage} compact />
+                          </View>
+                        ) : undefined
+                      }
+                    />
+                  );
+                })}
+              </OrderSection>
+            ))}
+          </>
+        )}
+        {ai.isSuccess && order.isError && !order.data ? <LoadFailed onRetry={() => void order.refetch()} /> : null}
+        {groups.length > 0 && connect ? (
+          <>
+            <Gap />
+            <GroupedList>{connect}</GroupedList>
+          </>
+        ) : null}
+        {can(org, "manage_credentials") ? <KeysSection locale={i18n.language} /> : null}
+        <PersonalParts />
+      </ScrollView>
+    </View>
+  );
+}
+
+/**
+ * An account's actions (the web's row buttons and its detail's ⋯), in the app's sheet: its place in an order (`g`),
+ * giving it to one more of the viewer's agents, Usar em todos os agentes, Renomear, Entrar de novo and Desconectar.
+ * `ownOf`: its logins (one per agent where it signs in once per agent), every one of them removed together.
+ */
+export function useAccountActions(
+  ownOf: (a: Account) => { logins: Account[]; signedOut: Account[]; unknown: Account[] },
+) {
+  const { t } = useTranslation();
+  const { orgId, org } = useOrg();
+  const computerOf = (name: string) => computerNameOf(t, org?.name ?? "", name, isPersonal(org));
+  const api = useApi();
+  const qc = useQueryClient();
+  const toast = useToast();
+  const machines = useMachines(orgId);
+  const dir = useDirectory();
+  const meId = useMeId();
+  const status = useAiStatus(orgId);
+  const move = useMoveAccountInOrder(orgId);
+  const loginsOf = (a: Account) => ownOf(a).logins;
   const refetch = () => void qc.invalidateQueries({ queryKey: keys.aiAccounts(orgId) });
   const failed = () => {
     errorHaptic();
     toast({ title: t("agentPage.work.failed"), icon: "x" });
   };
-
   // Renaming on a screen of its own, on every system (screens, not sheets): its field waits for the person's tap.
   const rename = (a: Account) => openRenameAiAccount(a.machineId, a.id);
   // Signing in again (a coding plan's new key) on its plan's page of Connect an AI, a screen with room for the keyboard:
@@ -181,18 +403,45 @@ function AiAccounts() {
           text: t("aiAccounts.page.disconnect"),
           style: "destructive",
           onPress: () =>
-            api.machines.removeAccount(orgId, a.machineId, a.id).then(() => {
-              successHaptic();
-              toast({ title: t("aiAccounts.page.disconnected", { label: a.label }), icon: "check" });
-              refetch();
-              void qc.invalidateQueries({ queryKey: keys.agents(orgId) });
-            }, failed),
+            Promise.all(loginsOf(a).map((l) => api.machines.removeAccount(orgId, l.machineId, l.id))).then(
+              () => {
+                successHaptic();
+                toast({ title: t("aiAccounts.page.disconnected", { label: a.label }), icon: "check" });
+                refetch();
+                void qc.invalidateQueries({ queryKey: keys.agents(orgId) });
+              },
+              () => {
+                // Some logins may be gone already: the list is read again either way.
+                failed();
+                refetch();
+              },
+            ),
         },
       ],
     );
-  const actions = (a: Account) => {
+  const put = (accountId: string, index: number | null) => {
+    if (index === null) return;
+    move.mutate(
+      { accountId, index },
+      {
+        onSuccess: () => successHaptic(),
+        onError: (e) => {
+          errorHaptic();
+          toast({ title: errorText(t, e), icon: "x" });
+        },
+      },
+    );
+  };
+  /** Move up and Move down for an account of `g`, when the viewer may move it: none at that end. */
+  const moves = (g: AccountOrderGroup, a: OrderAccount) =>
+    orderMoves(g.accounts, a).map((m) => ({
+      label: t(m.step < 0 ? "contextMenu.moveUp" : "contextMenu.moveDown"),
+      onPress: () => put(orderMover(g.accounts, a.id), m.index),
+    }));
+  const actions = (a: Account, g?: AccountOrderGroup) => {
     const plan = planOf(a.provider);
-    const out = offersSignInAgain(a);
+    const placedAs = g?.accounts.find((x) => x.id === a.id);
+    const out = loginsOf(a).some(offersSignInAgain);
     const toGive = meId
       ? agentsToGive({
           account: a,
@@ -203,8 +452,9 @@ function AiAccounts() {
         })
       : [];
     choose(
-      a.label,
+      accountTitle(t, a),
       [
+        ...(g && placedAs ? moves(g, placedAs) : []),
         ...toGive.map((g) => ({
           label: t("aiAccounts.page.useFor", agentGrammar(g.name)),
           onPress: () => void give(a, g),
@@ -217,7 +467,7 @@ function AiAccounts() {
           ? [
               {
                 label: plan ? t("aiAccounts.page.newKey") : t("aiAccounts.page.signInAgain"),
-                onPress: () => signInAgain(a),
+                onPress: () => signInAgain(againLogin(ownOf(a)) ?? a),
               },
             ]
           : []),
@@ -227,102 +477,52 @@ function AiAccounts() {
     );
   };
 
-  // Under a hold its note says what comes first: an invitation to connect a plan would contradict it.
-  const none = !hold && ai.isSuccess && rows.length === 0 && own.length === 0;
-  const adds = !none && !hold;
+  return {
+    actions,
+    moves,
+    moving: move.isPending,
+    remove,
+    rename,
+    signInAgain: (a: Account) => signInAgain(againLogin(ownOf(a)) ?? a),
+  };
+}
+
+type OrderAccount = AccountOrderGroup["accounts"][number];
+
+/**
+ * "Ordem de uso" (ADR 0041 §6), as the web's groups in IA e uso: one computer's Claude or ChatGPT accounts a run goes
+ * through at a limit, numbered first to last, with the plan's terms on a quiet line. Whoever may move an account (its
+ * owner or an admin) moves it with Move up and Move down in its ⋯.
+ */
+function OrderSection({
+  group,
+  computer,
+  children,
+}: {
+  group: AccountOrderGroup;
+  computer: string | null;
+  children: ReactNode;
+}) {
+  const { t } = useTranslation();
+  const plan = t(`aiAccounts.connect.${group.kind}`);
+  const title = t("usageViews.order.title", { plan });
   return (
-    <View style={[styles.screen, { backgroundColor: c.grouped }]}>
-      <PushedHeader
-        title={t(isPersonal(org) ? "settings.section.keysPersonal" : "mobile.ai.row")}
-        solid={false}
-        grouped
-      />
-      <ScrollView
-        contentInsetAdjustmentBehavior="automatic"
-        refreshControl={<RefreshControl refreshing={pull.refreshing} onRefresh={pull.onRefresh} />}
-        contentContainerStyle={[styles.in, { paddingBottom: insets.bottom + 24 }]}
-      >
-        <GroupedHeader
-          hint={{ name: t("common.about", { label: t("aiAccounts.page.title") }), text: t("aiAccounts.page.hint") }}
+    <View>
+      <GroupedHeader hint={{ name: t("common.about", { label: title }), text: t("usageViews.order.hint") }}>
+        {computer ? `${title} ${t("aiAccounts.page.on", { computer })}` : title}
+      </GroupedHeader>
+      <View style={styles.terms}>
+        <InfoHint
+          name={t("common.about", { label: t("usageViews.order.termsLabel", { plan }) })}
+          text={t("usageViews.order.termsHint", { plan })}
+          variant="footnote"
         >
-          {t("aiAccounts.page.title")}
-        </GroupedHeader>
-        {ai.isLoading ? <SkeletonList rows={2} /> : null}
-        {ai.isError && !ai.data ? <LoadFailed onRetry={() => void ai.refetch()} /> : null}
-        {none ? (
-          <FirstUse place="ai" size="panel" acts label={t("aiAccounts.page.connect")} onPress={() => openConnectAi()} />
-        ) : null}
-        {/* One list, as Settings' own: the computers' sign-ins, the person's accounts, then the way to one more. The
-            mark sits in the rows' leading column and the hairlines start at the words. */}
-        <GroupedList>
-          {own.map((o) => (
-            <GroupedRow
-              key={o.key}
-              leading={<ProviderLogo id={o.kind} size="sm" />}
-              label={ownSignInTitle(t, o)}
-              sub={t("aiAccounts.page.ownOn", { computer: o.computer })}
-              below={
-                o.usage ? (
-                  <View style={styles.below}>
-                    <PlanMeter usage={o.usage} compact />
-                  </View>
-                ) : undefined
-              }
-            />
-          ))}
-          {rows.map((a) => {
-            const plan = planOf(a.provider);
-            const out = signInOf(a) === "signed_out";
-            const unknown = signInOf(a) === "unknown";
-            const facts = [
-              a.email ??
-                (a.keyHint
-                  ? t("aiAccounts.page.keyEnds", { hint: a.keyHint })
-                  : identityUnknown(a, machineOf(a))
-                    ? t("aiAccounts.page.identityUnknown")
-                    : null),
-              several ? t("aiAccounts.page.on", { computer: computerOf(a.computer) }) : null,
-              a.usedBy.length > 0
-                ? t("aiAccounts.page.usedBy", { count: a.usedBy.length, agents: names(a.usedBy) })
-                : t("aiAccounts.page.noAgent"),
-            ].filter(Boolean);
-            return (
-              <GroupedRow
-                key={a.id}
-                leading={<ProviderLogo id={a.provider ?? a.kind} size="sm" off={out} />}
-                label={accountTitle(a)}
-                sub={facts.join(" · ")}
-                subLines={2}
-                more
-                onPress={() => actions(a)}
-                below={
-                  out || unknown || a.usage || (plan && !plan.usage) ? (
-                    <View style={styles.below}>
-                      {out ? (
-                        <Note icon="x">{plan ? t("aiAccounts.page.keyRefused") : t("aiAccounts.page.signedOut")}</Note>
-                      ) : null}
-                      {unknown ? <Note icon="info">{t("aiAccounts.page.statusUnknown")}</Note> : null}
-                      {a.usage ? (
-                        <PlanMeter usage={a.usage} compact />
-                      ) : plan && !plan.usage ? (
-                        <Text variant="footnote" tone="faint">
-                          {t("aiAccounts.usage.notShared", { maker: plan.maker })}
-                        </Text>
-                      ) : null}
-                    </View>
-                  ) : undefined
-                }
-              />
-            );
-          })}
-          {adds && ai.isSuccess ? (
-            <GroupedRow icon="plus" label={t("aiAccounts.page.connect")} onPress={() => openConnectAi()} />
-          ) : null}
-        </GroupedList>
-        {hold ? <PlanHoldNote org={org} inset /> : null}
-        {can(org, "manage_credentials") ? <KeysSection locale={i18n.language} /> : null}
-        <PersonalParts />
-      </ScrollView>
+          <Text variant="footnote" tone="muted">
+            {t("usageViews.order.terms", { plan })}
+          </Text>
+        </InfoHint>
+      </View>
+      <GroupedList>{children}</GroupedList>
     </View>
   );
 }
@@ -549,10 +749,6 @@ function KeyPrompt({
   );
 }
 
-/** Opens the rename of one of the person's AI accounts (its computer's and its own id). */
-const openRenameAiAccount = (machineId: string, accountId: string) =>
-  router.push({ pathname: "/ai-account-rename", params: { machineId, accountId } });
-
 /**
  * Renaming an AI account, pushed from its row's actions: what the name is for, the name (one line, however it is typed
  * or pasted), Save in the bar. The field waits for a tap: a screen that opens never raises the keyboard by itself.
@@ -564,12 +760,17 @@ export function RenameAiAccountScreen({ machineId, accountId }: { machineId: str
   const qc = useQueryClient();
   const toast = useToast();
   const ai = useAiAccounts(orgId);
-  const account = ai.data?.accounts.find((a) => a.id === accountId && a.machineId === machineId);
+  // Someone else's account too, for whoever manages it (Gerenciar).
+  const account = [...(ai.data?.accounts ?? []), ...(ai.data?.hub?.accounts ?? [])].find(
+    (a) => a.id === accountId && a.machineId === machineId,
+  );
   const [draft, setDraft] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const name = (draft ?? account?.label ?? "").replace(/\s+/g, " ").trim();
-  const ready = Boolean(account) && name !== "" && name !== account?.label && !overLimit(name, NAME_LIMIT);
-  const leave = useUnsavedGuard(draft !== null && name !== account?.label && !busy);
+  // The automatic name ("Claude 2") is no name of theirs: the field starts empty, showing the email.
+  const given = account?.named === true ? account.label : "";
+  const name = (draft ?? given).replace(/\s+/g, " ").trim();
+  const ready = Boolean(account) && name !== "" && name !== given && !overLimit(name, NAME_LIMIT);
+  const leave = useUnsavedGuard(draft !== null && name !== given && !busy);
   const save = async () => {
     if (!ready || busy) return;
     setBusy(true);
@@ -578,18 +779,22 @@ export function RenameAiAccountScreen({ machineId, accountId }: { machineId: str
       leave();
       successHaptic();
       toast({ title: t("aiAccounts.page.renamed", { label: name }), icon: "check" });
-      void qc.invalidateQueries({ queryKey: keys.aiAccounts(orgId) });
+      // Every list that shows it reads it again: the accounts, each agent's AI (`keys.agentBrain`'s prefix), usage.
+      for (const key of [keys.aiAccounts(orgId), keys.planUsage(orgId), ["org", orgId, "agent"]])
+        void qc.invalidateQueries({ queryKey: key });
       goBack();
-    } catch {
+    } catch (e) {
       errorHaptic();
-      toast({ title: t("agentPage.work.failed"), icon: "x" });
+      toast({ title: errorText(t, e), icon: "x" });
     } finally {
       setBusy(false);
     }
   };
   return (
     <SettingsPage
-      title={account ? t("aiAccounts.page.renameTitle", { label: account.label }) : t("aiAccounts.page.rename")}
+      title={
+        account ? t("aiAccounts.page.renameTitle", { label: accountTitle(t, account) }) : t("aiAccounts.page.rename")
+      }
       action={{ label: t("common.save"), disabled: !ready, onPress: () => void save() }}
       busy={busy}
     >
@@ -603,14 +808,14 @@ export function RenameAiAccountScreen({ machineId, accountId }: { machineId: str
           {/* A field row of the page, the list its surface, as every field of the settings pages. */}
           <GroupedList>
             <TextArea
-              value={draft ?? account.label}
+              value={draft ?? given}
               onChangeText={setDraft}
               multiline={false}
               minHeight={50}
               limit={NAME_LIMIT}
               returnKeyType="done"
               onSubmitEditing={() => void save()}
-              placeholder={t("aiAccounts.page.nameLabel")}
+              placeholder={account.email ?? t("aiAccounts.rename.placeholder")}
               accessibilityLabel={t("aiAccounts.page.nameLabel")}
               style={styles.bare}
             />
@@ -629,4 +834,7 @@ const styles = StyleSheet.create({
   // The settings screens' side margin: the groups on the same 16 pt edge as everywhere else.
   in: { paddingHorizontal: 16, paddingTop: 8 },
   below: { gap: 8, marginTop: 6 },
+  // On the header's edge, above the group like a second header line.
+  terms: { paddingHorizontal: 16, paddingBottom: 8, marginTop: -2 },
+  place: { minWidth: 24, textAlign: "center", fontVariant: ["tabular-nums"], fontWeight: "600" },
 });

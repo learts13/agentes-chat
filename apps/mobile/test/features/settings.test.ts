@@ -1,8 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { AuthConfig, ComputerSetup, Machine, StorageConfig } from "@agenteschat/client";
+import type { AuditRow, AuthConfig, ComputerSetup, Machine, StorageConfig } from "@agenteschat/client";
 import { showsAbout } from "@agenteschat/client/lib/about";
+import {
+  auditDetailEntries,
+  auditOutcome,
+  auditReason,
+  auditReasonLabel,
+  auditSentence,
+  auditSubLine,
+} from "@agenteschat/client/lib/audit";
 import { type SetupView, setupView } from "@agenteschat/client/lib/computer";
 import { proofToSend } from "@agenteschat/client/lib/deletion";
 import { changedByText, changesSinceLink, skillPendingViews, skillUpdateWords } from "@agenteschat/client/lib/skills";
@@ -225,10 +233,11 @@ describe("a personal workspace's settings on the phone (ADR 0159 §3): one short
   test("the settings screen picks the short list in a personal workspace; a team's keeps its groups", () => {
     const screen = src("settings/WorkspaceScreen.tsx");
     expect(screen).toContain("return personal ? <PersonalSettingsList others={others} /> : <TeamSettingsList />;");
-    // Your account first (the person's own page), then the sections in a personal workspace's names, then Advanced.
-    expect(screen).toContain('onPress={() => router.push("/me/account")}');
+    // Your account first (the person's own page), then the sections in a personal workspace's names, then Advanced
+    // (pushed, or beside the list on a large screen: `useOpenPage`, ADR 0212).
+    expect(screen).toContain('onPress={() => open("/me/account")}');
     expect(screen).toContain("label={t(settingsSectionNameKey(org, s.id))}");
-    expect(screen).toContain('onPress={() => router.push("/settings/advanced")}');
+    expect(screen).toContain('onPress={() => open("/settings/advanced")}');
     const advanced = src("settings/AdvancedScreen.tsx");
     expect(advanced).toContain("<SectionGroups");
     // Its own group is the screen's title, never a header saying "Avançado" again under it.
@@ -605,7 +614,7 @@ describe("Armazenamento", () => {
   test("VoiceOver reads the line with its option: it is part of the row's label", () => {
     const src = (path: string) => readFileSync(join(import.meta.dir, "..", "..", "src", path), "utf8");
     expect(src("ui/Grouped.tsx")).toContain(
-      'accessibilityLabel={[label, sub, belowText, said, value, valueNote].filter(Boolean).join(", ")}',
+      'accessibilityLabel={[leadingSaid, label, sub, belowText, said, value, valueNote].filter(Boolean).join(", ")}',
     );
     expect(src("features/settings/StorageScreen.tsx")).toContain("belowText: usage ?? undefined");
   });
@@ -656,7 +665,8 @@ test("Sobre o agentes.chat in Você: on every self-hosted server, old ones too; 
   // Nor before the server says which it is: the Cloud never shows it for a moment.
   expect(showsAbout(undefined)).toBe(false);
   const me = readFileSync(join(import.meta.dir, "..", "..", "src", "features", "me", "MeScreen.tsx"), "utf8");
-  expect(me).toContain("const about = showsAbout(useAuthConfig().data);");
+  expect(me).toContain("const server = useAuthConfig().data;");
+  expect(me).toContain("const about = showsAbout(server);");
   expect(me).toContain("{about ? (");
   expect(me).toContain('onPress={() => open("/me/about")}');
 });
@@ -666,6 +676,111 @@ test("Auditoria's row screen: the call's title in words, and what the tool said 
   expect(src).toContain("title={auditHint(t, row) ?? auditPhrase(t, row, i18n.language)}");
   const tech = src.slice(src.indexOf('t("audit.panel.tech")'));
   expect(tech).toContain('label={t("audit.panel.techSaid")} sub={said}');
+});
+
+test("Auditoria says an operator's read of the workspace in the words the web uses: the sentence, why under it and on the row's screen", () => {
+  const src = readFileSync(join(import.meta.dir, "..", "..", "src", "features", "settings", "AuditScreen.tsx"), "utf8");
+  // The list's row: who read what, and under it at whose request or for which fault.
+  expect(src).toContain("const { name, text } = auditSentence(t, row, i18n.language);");
+  expect(src).toContain("const sub = auditSubLine(t, row, i18n.language);");
+  // The row's own screen says why in the reason's place.
+  expect(src).toContain("const reason = auditReason(t, row, i18n.language);");
+  expect(src).toContain("{reason ? (");
+});
+
+test("Auditoria says an operator's answer to a support request as the web does: who answered and how, whose request under it and on the row's screen", async () => {
+  const [pt, en] = [await translator("pt-BR"), await translator("en")];
+  const name = "Maria Aleksandra Wiśniewska-Kowalczyk de Vasconcelos";
+  const replied = (details: Record<string, unknown>, onBehalfOf: AuditRow["onBehalfOf"]): AuditRow => ({
+    id: "p1",
+    at: "2026-10-28T12:00:00Z",
+    actor: { type: "system", id: null, name: null },
+    action: "operator.support_replied",
+    target: { type: "support_request", id: "req-1" },
+    details,
+    runId: null,
+    channelId: null,
+    channel: null,
+    onBehalfOf,
+    outcome: null,
+    approval: null,
+    secret: null,
+  });
+  const assisted = replied({ template: "text", chars: 1840, assistedByAi: true }, { id: "u1", name });
+  // The list's row: no name before the sentence (the system's), so the label is the sentence alone.
+  expect(auditSentence(pt, assisted, "pt-BR")).toEqual({
+    name: null,
+    text: "Quem cuida deste servidor respondeu por e-mail",
+  });
+  expect(auditSubLine(pt, assisted)).toBe(`pedido de suporte de ${name} · com um assistente de IA`);
+  expect(auditSentence(en, assisted, "en").text).toBe("Whoever runs this server answered by email");
+  // The row's own screen says it whole in the reason's place: the list's line is one line there.
+  expect(auditReason(en, assisted)).toBe(`support request from ${name} · with an AI assistant`);
+  // On agentes.chat's own servers, with no AI assistant, of an account that is gone since.
+  const plain = replied({ template: "received", chars: 0, assistedByAi: false, cloud: true }, null);
+  expect(auditSentence(en, plain, "en").text).toBe("agentes.chat support answered by email");
+  expect(auditSubLine(en, plain)).toBe("support request from Removed");
+  expect(auditOutcome(en, plain)).toBeNull();
+});
+
+test("Auditoria says an operator's disclosure of a safety review as the web does: who reviewed, and under it how many items and which days", async () => {
+  const [pt, en, ru] = [await translator("pt-BR"), await translator("en"), await translator("ru")];
+  const year = new Date().getFullYear();
+  const disclosed = (details: Record<string, unknown>): AuditRow => ({
+    id: "d1",
+    at: "2026-10-28T12:00:00Z",
+    actor: { type: "system", id: null, name: null },
+    action: "operator.content_review_disclosed",
+    target: { type: "organization", id: null },
+    details,
+    runId: null,
+    channelId: null,
+    channel: null,
+    onBehalfOf: null,
+    outcome: null,
+    approval: null,
+    secret: null,
+  });
+  const week = { from: `${year}-03-03T12:00:00.000Z`, to: `${year}-03-09T12:00:00.000Z` };
+  const many = disclosed({ ...week, count: 10000 });
+  // The list's row: no name before the sentence (the system's), so the label is the sentence alone, with no number
+  // and no date. Under it the count first, then the days.
+  expect(auditSentence(pt, many, "pt-BR")).toEqual({
+    name: null,
+    text: "Quem cuida deste servidor analisou conteúdo por segurança",
+  });
+  expect(auditSubLine(pt, many, "pt-BR")).toBe("10.000 itens · 3 mar a 9 mar");
+  expect(auditSentence(en, many, "en").text).toBe("Whoever runs this server reviewed content for safety");
+  expect(auditSubLine(en, many, "en")).toBe("10,000 items · Mar 3 to Mar 9");
+  // One item, on one day, on agentes.chat's own servers.
+  const one = disclosed({
+    from: `${year}-03-09T10:00:00.000Z`,
+    to: `${year}-03-09T13:00:00.000Z`,
+    count: 1,
+    cloud: true,
+  });
+  expect(auditSentence(pt, one, "pt-BR").text).toBe("O suporte do agentes.chat analisou conteúdo por segurança");
+  expect(auditSubLine(pt, one, "pt-BR")).toBe("1 item · 9 mar");
+  expect(auditSentence(en, one, "en").text).toBe("agentes.chat support reviewed content for safety");
+  expect(auditSubLine(en, one, "en")).toBe("1 item · Mar 9");
+  // A date of another year says its year.
+  const years = disclosed({ from: `${year - 1}-12-28T12:00:00.000Z`, to: `${year}-01-03T12:00:00.000Z`, count: 12 });
+  expect(auditSubLine(en, years, "en")).toBe(`12 items · Dec 28, ${year - 1} to Jan 3, ${year}`);
+  // Each plural form of a language that has four, the count the line's first word.
+  const items = (count: number) => auditSubLine(ru, disclosed({ ...week, count }), "ru").split(" · ")[0];
+  expect([1, 2, 5, 21].map(items)).toEqual(["1 элемент", "2 элемента", "5 элементов", "21 элемент"]);
+  // The row's own screen says the same line where a reason goes, under no heading, and no outcome. The three values
+  // are not listed again under its details.
+  expect([auditReason(en, many, "en"), auditReasonLabel(en, many), auditOutcome(en, many)]).toEqual([
+    "10,000 items · Mar 3 to Mar 9",
+    null,
+    null,
+  ]);
+  expect(auditDetailEntries(many.details, many.action)).toEqual([]);
+  const src = readFileSync(join(import.meta.dir, "..", "..", "src", "features", "settings", "AuditScreen.tsx"), "utf8");
+  expect(src).toContain("{...(sub ? { sub } : {})}");
+  expect(src).toMatch(/\{reasonLabel \? `[^`]+` : reason\}/);
+  expect(src).toContain("const changeDetails = isCall ? [] : auditDetailEntries(row.details, row.action);");
 });
 
 test("my photo on Você changes it with a tap, through Conta's own Alterar foto", () => {

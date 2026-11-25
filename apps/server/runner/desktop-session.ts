@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createCipheriv, createHash, randomBytes, randomInt } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import {
@@ -23,6 +23,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import {
   type AgentScope,
   DESKTOP_SIZE,
+  type DesktopStart,
   type MachineReplies,
   type RunnerDesktopInfo,
 } from "@agenteschat/adapters/machine-protocol";
@@ -303,6 +304,32 @@ export function hostMemAvailable(): number | null {
     return null;
   }
 }
+
+/** `kern.memorystatus_level` (the share of memory macOS can hand out now, in percent) in bytes; null when unreadable. */
+export function pressureLevelBytes(level: string, totalBytes: number): number | null {
+  const text = level.trim();
+  const n = Number(text);
+  return text !== "" && Number.isInteger(n) && n >= 0 && n <= 100 ? (n / 100) * totalBytes : null;
+}
+
+/**
+ * Free memory now, for background tasks' room: Linux `MemAvailable`, macOS its memory-pressure level (`os.freemem()`
+ * reads near zero on a healthy Mac, whose free memory sits in caches it hands back), Windows its available physical
+ * memory (`os.freemem()` there). Null where none can be read.
+ */
+export function freeMemoryNow(): number | null {
+  if (process.platform === "linux") return hostMemAvailable();
+  if (process.platform === "win32") return os.freemem();
+  if (process.platform !== "darwin") return null;
+  const r = spawnSync("sysctl", ["-n", "kern.memorystatus_level"], { encoding: "utf8", timeout: 2000 });
+  return r.status === 0 ? pressureLevelBytes(r.stdout, os.totalmem()) : null;
+}
+
+/** The processor has stayed over 90% busy for the last minute: the 1-minute load average against its CPUs (0 on Windows). */
+export const cpuBusyNow = (load = os.loadavg()[0] ?? 0, cpus = os.availableParallelism()) => load >= 0.9 * cpus;
+
+/** What a background task's start reads (`TaskManagerOptions.room`). */
+export const taskRoomNow = () => ({ free: freeMemoryNow(), cpuBusy: cpuBusyNow() });
 
 /** Where and as whom an agent's desktop runs. */
 export interface DesktopUser {
@@ -587,6 +614,8 @@ export interface DesktopSessionsOptions {
   inUse?: (agentId: string) => boolean;
   /** A viewer of the agent's desktop came or went (`status().streams`). */
   onViewers?: (agentId: string) => void;
+  /** A start ended: where its time went, or the code it failed with (the server's `desktop.started`). */
+  onStarted?: (agent: AgentScope, start: DesktopStart) => void;
   /** Browser on the agent's desktop was clicked (`desktop-browser.ts`); without it the desktop has no socket for it. */
   openBrowser?: (agent: AgentScope, installing: () => void) => Promise<void>;
   /** How this runner starts itself, which Browser runs (default: this process). */
@@ -754,6 +783,8 @@ export class DesktopSessions {
   private readonly operations = new Map<string, number>();
   /** When each agent's desktop was started again after ending by itself. */
   private readonly restarts = new Map<string, number[]>();
+  /** Each agent's desktop start under way for `ensure`: another `ensure` meanwhile gets its outcome. */
+  private readonly starting = new Map<string, Promise<MachineReplies["desktop.session.start"]>>();
   /** Displays of desktops being started. */
   private readonly claimed = new Set<number>();
   /** Refreshes run one after another: each starts dozens of short processes on the computer. */
@@ -805,7 +836,10 @@ export class DesktopSessions {
    * `chrome`: the agent's Chrome is about to start on it, so there must be room for that too.
    */
   ensure(agent: AgentScope, opts: { chrome?: boolean } = {}): Promise<MachineReplies["desktop.session.start"]> {
-    return this.serial(agent.id, async () => {
+    // A viewer's retry while its first open still starts the desktop: the same start, never a second one after it.
+    const under = this.starting.get(agent.id);
+    if (under && !opts.chrome) return under;
+    const run = this.serial(agent.id, async () => {
       let d = this.desktops.get(agent.id);
       const running = d !== undefined && this.alive(d);
       if (d && running) {
@@ -815,7 +849,14 @@ export class DesktopSessions {
         if (d) await this.end(d);
         const info = this.info();
         if (!info.available) throw new RunnerError("desktop_unavailable", info.reason ?? "Desktops can't run here");
-        d = await this.start(agent);
+        const began = this.now();
+        try {
+          d = await this.start(agent);
+        } catch (err) {
+          const error = err instanceof RunnerError ? err.code : "internal";
+          this.opts.onStarted?.(agent, { ms: this.now() - began, error });
+          throw err;
+        }
       }
       if (opts.chrome && !(await this.makeRoom(agent.id))) {
         throw new RunnerError(
@@ -825,6 +866,14 @@ export class DesktopSessions {
       }
       return this.started(d, !running);
     });
+    if (!opts.chrome && this.processId(agent.id) === null) {
+      this.starting.set(agent.id, run);
+      const done = () => {
+        if (this.starting.get(agent.id) === run) this.starting.delete(agent.id);
+      };
+      run.then(done, done);
+    }
+    return run;
   }
 
   /**
@@ -1372,6 +1421,16 @@ export class DesktopSessions {
         this.opts.log(
           `the desktop of ${agent.handle} started on :${display} in ${seconds(now - began)}: room and its user ${seconds(userAt - began)}, prepared in ${seconds(preparedAt - userAt)}, its screen in ${seconds(screenAt - preparedAt)} (the look in ${seconds(lookMs)} meanwhile), its session in ${seconds(now - sessionAt)}`,
         );
+        this.opts.onStarted?.(agent, {
+          ms: now - began,
+          steps: {
+            room: userAt - began,
+            prepared: preparedAt - userAt,
+            screen: screenAt - preparedAt,
+            look: lookMs,
+            session: now - sessionAt,
+          },
+        });
         return d;
       } finally {
         closeSync(log);

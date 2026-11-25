@@ -1,9 +1,12 @@
 import type {
   BrainEffort,
+  BrainProgressKind,
   BrainSpeed,
+  BrainStallPhase,
   BrainTurnRequest,
   BrainTurnTimings,
   ProviderFailureCause,
+  WireWorkflowAgent,
 } from "@agenteschat/adapters";
 import type { ToolImage } from "@agenteschat/providers";
 import { planOf } from "@agenteschat/providers/plans";
@@ -25,16 +28,17 @@ export const BRAIN_NAMES: Readonly<Record<ComputerBrainKind, string>> = {
 };
 
 /**
- * Whether a computer brain runs on a computer's system (`hello.os`), as its runner allows: Cursor and Grok Build not on
- * Windows yet, the Antigravity CLI on Linux only (ADR 0143: elsewhere it keeps its sign-in in the computer user's one
- * keychain). A system nobody reported passes: the runner says.
+ * Whether a computer brain runs on a computer's system (`hello.os`), as its runner allows: Cursor not on Windows yet.
+ * A system nobody reported passes: the runner says.
  */
 export function brainRunsOn(kind: ComputerBrainKind, os: string | null | undefined): boolean {
   if (!os) return true;
-  if (kind === "antigravity") return os === "linux";
-  if (kind === "cursor" || kind === "grok") return os !== "windows";
+  if (kind === "cursor") return os !== "windows";
   return true;
 }
+
+/** A turn refused because its brain doesn't run on its computer's system (`brainRunsOn`): no runner asked, no retry. */
+export const SYSTEM_REFUSED = "brain_system";
 
 /** The plan each computer brain thinks with, as people buy it. */
 export const BRAIN_PLAN_NAMES: Readonly<Record<ComputerBrainKind, string>> = {
@@ -111,6 +115,8 @@ export interface BrainSession {
   cwd: string;
   /** Start in the agent's own folder, never one of its checkouts: the folder of its session before was gone. */
   ownFolder?: boolean;
+  /** A code session's turn (ADR 0215): `cwd` is its worktree. */
+  codeSession?: boolean;
 }
 
 export interface BrainTurn {
@@ -146,6 +152,11 @@ export interface BrainTurn {
   contextTokens?: number;
   /** Computer brains: a person waits on this turn (the line's first rank); the runner holds a slot for one. */
   personWaiting?: boolean;
+  /**
+   * Computer brains: the IANA zone of "Now" in the context (the person's, else the workspace's, a routine's own), which
+   * the CLI's clock reads too, so the date it sees is the one the person lives.
+   */
+  timeZone?: string;
   /** The text the person/system sent that starts this turn (also the last user message). */
   trigger: string;
   /**
@@ -198,6 +209,11 @@ export interface BrainIO {
 
 export type BrainEvent =
   | { type: "text_delta"; text: string }
+  /**
+   * A note the model wrote between its calls that its API keeps apart from the reply's text (Claude's progress update,
+   * a reasoning summary): the work's narration, never the reply. An older server drops it.
+   */
+  | { type: "note"; text: string }
   /** `executed` present = already executed elsewhere (computer brains via the MCP bridge): the engine only records/displays it. */
   | { type: "tool_call"; id: string; name: string; input: unknown; executed?: ToolResult }
   | {
@@ -209,10 +225,14 @@ export type BrainEvent =
       model?: string;
       cacheRead?: number;
       cacheWrite?: number;
-      /** Computer brains: the API calls the turn made, and the most uncached input and whole input one of them read. */
+      /**
+       * Computer brains: the API calls the turn made, the most uncached input and whole input one of them read, and
+       * the whole input its last one read (the session's size as the turn ends).
+       */
       calls?: number;
       maxUncached?: number;
       maxContext?: number;
+      lastContext?: number;
     }
   | { type: "limit"; resetsAt?: string }
   | { type: "done"; text: string; session?: { id: string }; timings?: BrainTurnTimings }
@@ -231,14 +251,45 @@ export type BrainEvent =
     }
   /** Messages handed mid-turn (`BrainIO.steerable`) that the turn read, by their `uuid`. */
   | { type: "steer_read"; uuids: string[] }
+  /**
+   * A computer brain finished an answer and went on (a message handed mid-turn read after it, work moved to the
+   * background): its own message now (ADR 0112). `done` holds only what came after it.
+   */
+  | { type: "answer"; text: string }
   /** Fast failed (`message`: the provider's words) and this turn answered at standard speed. */
   | { type: "speed_fallback"; message: string }
-  /** A computer brain started a call of its own: shown only, its `tool_call` with `executed` follows. */
-  | { type: "tool_started"; id: string; name: string }
+  /**
+   * A computer brain started a call of its own: shown only, its `tool_call` with `executed` follows. `input`: what it
+   * was given, from a newer runner (a code session shows its line while it runs, ADR 0215).
+   */
+  | { type: "tool_started"; id: string; name: string; input?: unknown }
   /** A file a tool of the brain's own made, in the agent's folder (Codex's image generation): shown with the reply. */
-  | { type: "file"; path: string };
+  | { type: "file"; path: string }
+  /**
+   * The computer stopped the brain's CLI for its silence (where it was, the tool that ran and on what, how long): the
+   * turn goes on in a resumed session (`resumed`), or ends (`brain_stalled`). Kept on the run's trail.
+   */
+  | { type: "stalled"; phase: BrainStallPhase; tool?: string; label?: string; silentMs: number; resumed: boolean }
+  /**
+   * A call of the brain's own that runs subagents (Claude Code's `Agent`, `Workflow`, ADR 0215) while they work: the
+   * subagent's latest call, how many it made, a workflow's agents, `ended` once over. Shown live only.
+   */
+  | {
+      type: "tool_progress";
+      id: string;
+      kind: BrainProgressKind;
+      step?: { name: string; input?: unknown };
+      calls?: number;
+      agents?: WireWorkflowAgent[];
+      ended?: { failed?: boolean };
+    };
 
 export interface Brain {
   kind: BrainKind;
   run(turn: BrainTurn, io: BrainIO): AsyncIterable<BrainEvent>;
+  /**
+   * The run was claimed: its computer starts the CLI its turn will most likely use now, while the engine builds the
+   * turn (`brain.warm`). Best effort, never fails; `turn` has no words yet.
+   */
+  warm?(turn: BrainTurn): Promise<void>;
 }

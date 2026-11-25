@@ -41,7 +41,7 @@ import {
   ValidationError,
 } from "@agenteschat/engine";
 import { createRoute, type OpenAPIHono, z } from "@hono/zod-openapi";
-import { installScript } from "../../runner/install-script";
+import { installScript, withoutTrailingSlashes } from "../../runner/install-script";
 import { requestIp, requestLimitIp } from "../http/client-ip";
 import { apiError, domainErrorResponse, errorResponse } from "../http/errors";
 import {
@@ -137,10 +137,17 @@ export const Machine = z
       description:
         "`connected`: a person paired it; `host`: this server's own computer (`HOST_COMPUTER_TOKEN`); `managed`: the workspace's own computer (ADR 0056 §10), which people can't remove and whose hostname, OS and arch aren't shown.",
     }),
-    online: z.boolean().openapi({ description: "Runner connected now. Changes come as `machine.status` events." }),
+    online: z.boolean().openapi({
+      description:
+        "Runner connected now, or asleep in standby and waking as it should (`standby`). Changes come as `machine.status` events.",
+    }),
     standby: z.boolean().openapi({
       description:
-        "The workspace's own computer is asleep in standby (ADR 0161): offline by design, it wakes when something wants it. A change comes as `machine.updated`.",
+        "The workspace's own computer is asleep in standby (ADR 0161): it wakes when something wants it, and reads online meanwhile. False again once a wake failed to bring it back in time. A change comes as `machine.updated`.",
+    }),
+    offlineCause: z.enum(["unresponsive", "stopped", "dropped"]).nullable().openapi({
+      description:
+        "Why it is offline, from its runner's last close: `unresponsive` (stopped answering: no network, or too busy), `stopped` (its runner stopped), `dropped` (the link dropped). Null: online, the workspace's own computer, or unknown.",
     }),
     lastSeenAt: z.string().nullable(),
     hostname: z.string(),
@@ -171,6 +178,10 @@ export const Machine = z
     cliErrors: z.record(z.string(), z.string()).nullable().openapi({
       description:
         "The coding CLIs there that can't start (`claude`, `codex`…), each with its own last error line; `git_missing`: Claude Code on Windows without Git for Windows. Null unless admin or the person who paired it.",
+    }),
+    codexSandbox: z.enum(["mxc", "unelevated", "none"]).nullable().openapi({
+      description:
+        "Windows: what holds Codex's commands there (`mxc`; `unelevated`, Codex's own sandbox where MXC is missing; `none`, nothing could). Null elsewhere, or until its runner knows.",
     }),
     remotePause: z.boolean().openapi({
       description:
@@ -223,6 +234,18 @@ export const Machine = z
       .nullable()
       .optional(),
     egress: z.object({ ip: z.string(), country: z.string().optional(), at: z.string() }).nullable().optional(),
+    egressVia: z
+      .object({ machineId: z.string(), name: z.string(), userName: z.string().nullable() })
+      .nullable()
+      .optional()
+      .openapi({
+        description:
+          "The workspace's own computer: the person's computer whose internet its agents' web traffic uses now (ADR 0237), and who connected it. Null: its usual way out.",
+      }),
+    moving: z.boolean().optional().openapi({
+      description:
+        "The workspace's own computer is away moving to another server: it comes back by itself in a few minutes. A change comes as `machine.updated`.",
+    }),
     egressWaiting: z.boolean().optional().openapi({
       description:
         "The workspace's own computer, online, has its agents waiting for their way out: its network sends them only through a proxy and none works now, so their connections are refused for a while. A change comes as `machine.updated`.",
@@ -244,10 +267,20 @@ export const Machine = z
   })
   .openapi("Machine");
 
+const PlanDropped = z.object({ kind: z.string(), provider: z.string().nullable() });
+
 export const ComputerTarget = z
   .union([
     z.object({ kind: z.literal("none") }),
-    z.object({ kind: z.literal("machine"), machineId: z.uuid(), name: z.string(), online: z.boolean() }),
+    z.object({
+      kind: z.literal("machine"),
+      machineId: z.uuid(),
+      name: z.string(),
+      online: z.boolean(),
+      planDropped: PlanDropped.optional().openapi({
+        description: "Set when the agent's plan is signed in only on the computer it left: sign in on this one too.",
+      }),
+    }),
   ])
   .openapi("ComputerTarget");
 
@@ -342,6 +375,9 @@ const MachineOutage = z
       .boolean()
       .openapi({ description: "The workspace's own computer (ADR 0056 §10): its platform is `other`." }),
     offlineSince: z.string().openapi({ description: "ISO time of its last sign of life." }),
+    moving: z.boolean().openapi({
+      description: "The workspace's own computer is away moving to another server: it comes back by itself.",
+    }),
     agents: z.array(
       z.object({
         agentId: z.uuid(),
@@ -401,6 +437,9 @@ const ComputerQueue = z
   .object({
     machineId: z.uuid(),
     name: z.string(),
+    moving: z.boolean().optional().openapi({
+      description: "It is away moving to another server: the line waits for it, back in a few minutes.",
+    }),
     working: z.array(
       z.object({
         runId: z.uuid(),
@@ -446,6 +485,10 @@ const MoveAgentsResult = z
     resumed: z.number().int().openapi({ description: "Waiting runs queued again on the new computer." }),
     stillWaiting: z.number().int().openapi({
       description: "Waiting runs that stay with the old computer (their cut-off turn already ran tools there).",
+    }),
+    planDropped: z.array(PlanDropped.extend({ agentId: z.uuid() })).openapi({
+      description:
+        "Moved agents whose plan is signed in only on the old computer (`kind`, a coding plan's `provider`): sign in on the new one too.",
     }),
   })
   .openapi("MoveAgentsResult");
@@ -1218,7 +1261,7 @@ export function registerMachinePublicRoutes(api: OpenAPIHono, deps: AppDeps) {
       const result = await pollDeviceToken({ db, pubsub: adapters.pubsub }, c.req.valid("json").deviceCode);
       if (!result.ok) return c.json({ error: result.error }, 400);
       const { ok: _ok, ...token } = result;
-      const url = `${config.PUBLIC_URL.replace(/\/+$/, "")}/org/${token.org.id}/settings/devices/${token.machineId}`;
+      const url = `${withoutTrailingSlashes(config.PUBLIC_URL)}/org/${token.org.id}/settings/devices/${token.machineId}`;
       return c.json({ ...token, url }, 200);
     },
   );

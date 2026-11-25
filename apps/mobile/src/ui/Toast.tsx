@@ -1,19 +1,21 @@
 import { TrueSheetOverlay } from "@lodev09/react-native-true-sheet";
-import { LinearGradient } from "expo-linear-gradient";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { type AccessibilityActionEvent, StyleSheet, View } from "react-native";
+import { type AccessibilityActionEvent, StyleSheet, useWindowDimensions, View } from "react-native";
 import { Gesture, GestureDetector, GestureHandlerRootView } from "react-native-gesture-handler";
 import Animated, { useAnimatedStyle, useSharedValue, withDelay, withSpring, withTiming } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { scheduleOnRN } from "react-native-worklets";
 import { AgentAvatar } from "@/agent/AgentAvatar";
 import { type AgentLookInput, lookOf } from "@/agent/looks";
+import { CodeWords } from "./CodeWords";
+import { activeWindowFold, toastInsets } from "./fold-room";
 import { Glass } from "./Glass";
 import { haptics } from "./haptics";
 import { Icon, type IconName } from "./Icon";
 import { PRESS_DELAY } from "./PressScale";
-import { type ToastTone, toastGlow, toastToneOf, toneColor } from "./palette";
+import { type ToastTone, toastToneOf, toneColor } from "./palette";
 import { Text } from "./Text";
+import { useWindowFold } from "./TwoPane";
 import { motion, useTheme } from "./theme";
 import { CHROME_MAX_SCALE, weights } from "./type-scale";
 
@@ -22,7 +24,7 @@ export interface ToastInput {
   subtitle?: string;
   /** Default: a check (done). */
   icon?: IconName;
-  /** The glow's and the icon's color; by default from the icon (`toastToneOf`: a failure, done, anything else). */
+  /** The icon's color; by default from the icon (`toastToneOf`: a failure, done, anything else). */
   tone?: ToastTone;
   /** Show this agent's face instead of the icon (looks from `rememberAgentLooks`). */
   agentId?: string;
@@ -51,7 +53,7 @@ const LEAVE_MS = 220;
 const GONE_MS = LEAVE_MS + 40;
 /** The toast's corner and the room around its icon tile: the tile's corner is the toast's less that room (concentric). */
 const TOAST_R = 22;
-const TOAST_PAD = 12;
+const TOAST_PAD = 10;
 /** Where the toast rests off screen, above the top edge. */
 const HIDDEN_Y = -160;
 /** A swipe up this far, or a flick, puts it away. */
@@ -65,6 +67,14 @@ const ACTION_SLOP = 10;
 const noop: ToastFn = () => {};
 
 /** `const toast = useToast(); toast({ title, subtitle?, icon?, agentId?, action? })`: a glass note from the top. */
+/** A toast's haptic by its tone (`toastToneOf`): the system's own failure, warning and success patterns, else a tap. */
+export function toastHaptic(tone: ToastTone) {
+  if (tone === "danger") haptics.error();
+  else if (tone === "warning") haptics.warning();
+  else if (tone === "success") haptics.success();
+  else haptics.light();
+}
+
 export function useToast(): ToastFn {
   return useContext(ToastContext) ?? noop;
 }
@@ -102,13 +112,23 @@ export function ToastHost({ children }: { children?: ReactNode }) {
  * presents (the app's sheets are all TrueSheet) and that VoiceOver still reaches while a sheet is up. Mounted only
  * while a toast shows, so it is put on top of whatever is on screen then (a screen presented whole included); touches
  * that miss the toast go through to what is under it. Gestures need a root of their own there, as tall as the toast
- * alone: on Android a touch passes through only where no view of the layer is.
+ * alone: on Android a touch passes through only where no view of the layer is. The overlay fills the window, so the
+ * window's fold applies as it is: folded like a book, the toast keeps to the half past the fold (ADR 0212).
  */
 function ToastLayer({ children }: { children: ReactNode }) {
   const insets = useSafeAreaInsets();
+  const { width } = useWindowDimensions();
+  const sides = toastInsets(width, activeWindowFold(useWindowFold()));
   return (
     <TrueSheetOverlay>
-      <GestureHandlerRootView style={[styles.layer, { top: insets.top + 6 }]}>{children}</GestureHandlerRootView>
+      {/* As wide as the screen (or the half past the fold), the capsule centered in it: only the capsule takes a
+          touch, the sides let it through. */}
+      <GestureHandlerRootView
+        pointerEvents="box-none"
+        style={[styles.layer, { top: insets.top + 6, left: sides.left, right: sides.right }]}
+      >
+        {children}
+      </GestureHandlerRootView>
     </TrueSheetOverlay>
   );
 }
@@ -121,7 +141,7 @@ function ToastLayer({ children }: { children: ReactNode }) {
  * waits longer and the word at its end runs it. A newer toast makes it leave first.
  */
 function ToastView({ item, replaced, onGone }: { item: Shown; replaced: boolean; onGone: (key: number) => void }) {
-  const { colors, shadows, reducedMotion, scheme } = useTheme();
+  const { colors, shadows, reducedMotion } = useTheme();
   const y = useSharedValue(reducedMotion ? 0 : HIDDEN_Y);
   const opacity = useSharedValue(0);
   const goneRef = useRef(onGone);
@@ -167,6 +187,13 @@ function ToastView({ item, replaced, onGone }: { item: Shown; replaced: boolean;
     if (leaving.current || hideTimer.current) return;
     arm(Math.max(RESUME_MS, left.current));
   }, [arm]);
+
+  // Felt as it comes in, in the same frame, by what it says: a failure buzzes as one, a done thing as one, the rest a
+  // light tap. Once per toast (a toast replaced before it shows still came).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: once, when the toast arrives
+  useEffect(() => {
+    toastHaptic(item.tone ?? toastToneOf(item.icon));
+  }, []);
 
   useEffect(() => {
     if (leaving.current) return;
@@ -250,7 +277,6 @@ function ToastView({ item, replaced, onGone }: { item: Shown; replaced: boolean;
   const actionStyle = useAnimatedStyle(() => ({ opacity: 1 - 0.4 * actionDown.get() }));
   const look = item.agent ?? (item.agentId ? lookOf(item.agentId) : undefined);
   const tone = item.tone ?? toastToneOf(item.icon);
-  const glow = toastGlow(colors, tone, scheme);
 
   return (
     <GestureDetector gesture={gesture}>
@@ -261,25 +287,16 @@ function ToastView({ item, replaced, onGone }: { item: Shown; replaced: boolean;
         onAccessibilityEscape={dismiss}
         style={[styles.box, { boxShadow: shadows.e3 }, style]}
       >
+        {/* A calm capsule on the screen's glass: the tone is the icon's color alone, no plate behind it and no tint. */}
         <Glass intensity={70} style={styles.glass}>
-          <LinearGradient
-            colors={glow.colors}
-            locations={glow.locations}
-            start={{ x: 0, y: 0.5 }}
-            end={{ x: 1, y: 0.5 }}
-            style={[StyleSheet.absoluteFill, { borderRadius: TOAST_R }]}
-            pointerEvents="none"
-          />
           {look ? (
-            <AgentAvatar agent={look} size={34} />
+            <AgentAvatar agent={look} size={24} />
           ) : (
-            <View style={[styles.tile, { backgroundColor: colors.raised, boxShadow: shadows.e1 }]}>
-              <Icon name={item.icon ?? "check"} size={18} color={toneColor(colors, tone)} />
-            </View>
+            <Icon name={item.icon ?? "check"} size={18} color={toneColor(colors, tone)} />
           )}
           <View style={styles.words}>
             <Text variant="subhead" numberOfLines={1} style={styles.title}>
-              {item.title}
+              <CodeWords text={item.title} />
             </Text>
             {item.subtitle ? (
               <Text variant="footnote" numberOfLines={2}>
@@ -325,19 +342,21 @@ function rubberband(overshoot: number, dimension = 80, constant = 0.55) {
 }
 
 const styles = StyleSheet.create({
-  // Under the status bar, 12 from the screen's sides; as tall as the toast.
-  layer: { position: "absolute", left: 12, right: 12 },
-  box: { borderRadius: TOAST_R },
+  // Under the status bar, 12 from the screen's sides (`toastInsets`); as tall as the toast.
+  layer: { position: "absolute", alignItems: "center" },
+  // As wide as its words (a one-line toast is a pill), up to the layer's width.
+  box: { borderRadius: TOAST_R, maxWidth: "100%" },
   glass: {
     borderRadius: TOAST_R,
     flexDirection: "row",
     alignItems: "center",
-    gap: 12,
-    padding: TOAST_PAD,
-    paddingHorizontal: 14,
+    gap: 10,
+    paddingVertical: TOAST_PAD,
+    paddingLeft: 14,
+    paddingRight: 18,
+    minHeight: 2 * TOAST_R,
   },
-  tile: { width: 34, height: 34, borderRadius: TOAST_R - TOAST_PAD, alignItems: "center", justifyContent: "center" },
-  words: { flex: 1, minWidth: 0 },
+  words: { flexShrink: 1, minWidth: 0 },
   title: { fontWeight: weights.semibold },
   // The word stands on its own at the end: no plate; the tap takes it from `ACTION_SLOP` before it to the toast's end.
   action: { paddingLeft: 4, minHeight: 34, justifyContent: "center" },

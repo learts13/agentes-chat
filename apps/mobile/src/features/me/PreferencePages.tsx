@@ -15,7 +15,8 @@ import type { SoundStyle } from "@agenteschat/ui/sfx";
 import { useFocusEffect } from "expo-router";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Linking, StyleSheet, View } from "react-native";
+import { Linking, Platform, StyleSheet, View } from "react-native";
+import { setLiveActivityOn, useLiveActivityOn } from "@/features/live-activity/switch";
 import { pushPermission, unregisterPush } from "@/lib/push";
 import { readValue, STORED } from "@/lib/storage";
 import { deviceLocale, readLocaleState, rememberLocale, setLocale } from "@/providers/i18n";
@@ -24,6 +25,7 @@ import { usePush } from "@/providers/push";
 import { GroupedFooter, GroupedHeader, GroupedList, GroupedRow, type IconName, SkeletonList, useToast } from "@/ui";
 import { LoadFailed } from "../shared/FirstUse";
 import { Page } from "./parts";
+import { SurfaceLinkRow } from "./SurfaceLink";
 
 /**
  * Você's smaller screens, each pushed from its row: Notificações, Ao abrir o app, Respostas dos agentes, Como os
@@ -101,6 +103,8 @@ export function NotificationsPage() {
   const toast = useToast();
   const { orgId } = useOrg();
   const push = usePushSwitch();
+  // The agents at work in the Dynamic Island (ADR 0210): this phone's own switch.
+  const liveActivityOn = useLiveActivityOn();
   const prefs = useNoticePrefs(orgId);
   const set = useSetNoticePref(orgId);
   const on = push.on ?? false;
@@ -117,7 +121,19 @@ export function NotificationsPage() {
           toggle={on}
           onPress={() => void push.set(!on)}
         />
+        {Platform.OS === "ios" ? (
+          <GroupedRow
+            label={t("mobile.me.liveActivity")}
+            hint={{
+              name: t("common.about", { label: t("mobile.me.liveActivity") }),
+              text: t("mobile.me.liveActivityHint"),
+            }}
+            toggle={liveActivityOn}
+            onPress={() => setLiveActivityOn(!liveActivityOn)}
+          />
+        ) : null}
       </GroupedList>
+      <SurfaceLinkRow />
       {prefs.isLoading ? (
         <>
           <View style={styles.gap} />
