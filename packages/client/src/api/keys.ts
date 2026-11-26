@@ -162,6 +162,8 @@ export const keys = {
   machineDevice: (userCode: string) => ["machine-device", userCode] as const,
   /** Settings → AI apps: mine, or the whole workspace's (`all`), both under `apps`. */
   apps: (orgId: string, all = false) => ["org", orgId, "apps", all ? "all" : "mine"] as const,
+  /** Settings › Integrations (ADR 0251). */
+  integrationApps: (orgId: string) => ["org", orgId, "integration-apps"] as const,
   /** An app's consent (`/autorizar?req=`): not under an organization, it is picked on that page. */
   appConsent: (requestId: string) => ["app-consent", requestId] as const,
   desktopLatest: (target: string, arch: string) => ["desktop-latest", target, arch] as const,
@@ -208,6 +210,8 @@ export const keys = {
   routines: (orgId: string) => ["org", orgId, "routines"] as const,
   routineRuns: (orgId: string, id: string) => ["org", orgId, "routines", "runs", id] as const,
   routineHook: (orgId: string, id: string) => ["org", orgId, "routines", "hook", id] as const,
+  routineRunCalls: (orgId: string, id: string, runId: string) =>
+    ["org", orgId, "routines", "runs", id, "calls", runId] as const,
   webhookSetup: (orgId: string, provider: string) => ["org", orgId, "routines", "webhook", provider] as const,
   calendar: (orgId: string) => ["org", orgId, "calendar"] as const,
   calendarRange: (orgId: string, from: string) => ["org", orgId, "calendar", from] as const,

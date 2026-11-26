@@ -17,6 +17,7 @@ import {
 import { resolveChannelAgentAsks } from "./admin-asks";
 import { managesAgent, OWNER_COLUMNS, ownsAgent, REACH_COLUMNS } from "./audience";
 import { caches } from "./cache";
+import { noteJoined, writeLeftLine } from "./channel-joins";
 import { endOfSector, requireSectorInOrg } from "./channel-sectors";
 import { wordsOf } from "./confidential";
 import { ConflictError, ForbiddenError, isUniqueViolation, NotFoundError, ValidationError } from "./errors";
@@ -373,7 +374,7 @@ export async function listChannels(db: Database, userId: string, orgId: string):
         coalesce(cr.muted, false) as muted, coalesce(cr.last_read_at, cm.created_at) as last_read_at,
         lm.id as last_id, lm.body as last_body, lm.meta as last_meta, lm.created_at as last_at, lm.author_type as last_author_type,
         lm.author_user_id as last_user_id, lm.author_agent_id as last_agent_id,
-        coalesce(lu.name, la.name) as last_author_name,
+        coalesce(lu.name, la.name, lm.meta -> 'app' ->> 'name') as last_author_name,
         ${channelCanSql(orgId, userId, "post")} as can_post,
         ${channelCanSql(orgId, userId, "talk_to_agents")} as can_call,
         (${maySql(sql`${orgId}::uuid`, sql`${userId}::text`, "manage_channels")} or (cm.id is not null
@@ -521,6 +522,20 @@ export async function isChannelMember(db: Executor, orgId: string, channelId: st
     .from(channelMembers)
     .where(
       and(eq(channelMembers.orgId, orgId), eq(channelMembers.channelId, channelId), eq(channelMembers.userId, userId)),
+    );
+  return row !== undefined;
+}
+
+async function isAgentInChannel(db: Executor, orgId: string, channelId: string, agentId: string) {
+  const [row] = await db
+    .select({ id: channelMembers.id })
+    .from(channelMembers)
+    .where(
+      and(
+        eq(channelMembers.orgId, orgId),
+        eq(channelMembers.channelId, channelId),
+        eq(channelMembers.agentId, agentId),
+      ),
     );
   return row !== undefined;
 }
@@ -729,7 +744,12 @@ export async function joinChannel(
     await publishChannelsChanged(options.pubsub, orgId);
   };
   if (channel.visibility === "public" || admin) {
-    await db.insert(channelMembers).values({ orgId, channelId, userId }).onConflictDoNothing();
+    const fresh = await db
+      .insert(channelMembers)
+      .values({ orgId, channelId, userId })
+      .onConflictDoNothing()
+      .returning({ id: channelMembers.id });
+    if (fresh.length > 0) await noteJoined(db, orgId, channelId, userId);
     await joined();
     return;
   }
@@ -743,7 +763,10 @@ export async function joinChannel(
         where c.id = ${channelId}::uuid and c.org_id = ${orgId}::uuid and ${channelAudienceSql("c", sql`${userId}`)}
         on conflict do nothing returning 1`),
     );
-    if (rows.length > 0) return true;
+    if (rows.length > 0) {
+      await noteJoined(tx, orgId, channelId, userId);
+      return true;
+    }
     return isChannelMember(tx, orgId, channelId, userId);
   });
   if (!byRole) throw new ForbiddenError("This channel is private");
@@ -863,7 +886,12 @@ export async function addChannelMember(
     if (!(await getMembership(db, member.userId, orgId))) {
       throw new ValidationError("That person is not a member of this organization");
     }
-    await db.insert(channelMembers).values({ orgId, channelId, userId: member.userId }).onConflictDoNothing();
+    const fresh = await db
+      .insert(channelMembers)
+      .values({ orgId, channelId, userId: member.userId })
+      .onConflictDoNothing()
+      .returning({ id: channelMembers.id });
+    if (fresh.length > 0 && channel.kind === "channel") await noteJoined(db, orgId, channelId, actorId);
     caches.channelMembers.delete(`${orgId}:${channelId}`);
     const event = {
       type: "channel.member_added" as const,
@@ -879,10 +907,13 @@ export async function addChannelMember(
   await refuseRightHand(db, orgId, member.agentId, "added to a channel");
   await requirePlacesAgent(db, membership, actorId, channel, member.agentId);
   const autoReply = member.autoReply ?? true;
+  // Only a real join is said: turning an agent already here to auto-reply adds no line.
+  const already = await isAgentInChannel(db, orgId, channelId, member.agentId);
   await db
     .insert(channelMembers)
     .values({ orgId, channelId, agentId: member.agentId, autoReply })
     .onConflictDoUpdate({ target: [channelMembers.channelId, channelMembers.agentId], set: { autoReply } });
+  if (!already && channel.kind === "channel") await noteJoined(db, orgId, channelId, actorId);
   caches.channelMembers.delete(`${orgId}:${channelId}`);
   caches.scopes.deletePrefix(`${orgId}:${member.agentId}:visible`);
   await publishChannelEvent(options.pubsub, {
@@ -1018,10 +1049,15 @@ export async function removeChannelMember(
       .limit(1);
     if (!stays) await closeChannel(db, orgId, channelId, options);
   }
+  // The line that says so comes after a person's live subscription ended: the conversation is no longer theirs.
+  const left = (who: { type: "person" | "agent"; id: string }) =>
+    gone.length > 0 ? writeLeftLine({ db, pubsub: options.pubsub }, orgId, channelId, who) : undefined;
   if ("userId" in member) {
     await announceChannelLeavers({ db, pubsub: options.pubsub }, orgId, [{ channelId, userId: member.userId }]);
+    await left({ type: "person", id: member.userId });
     return;
   }
+  await left({ type: "agent", id: member.agentId });
   caches.scopes.deletePrefix(`${orgId}:${member.agentId}:visible`);
   await publishChannelEvent(options.pubsub, {
     type: "channel.member_removed",

@@ -20,6 +20,7 @@ import {
 import { ClaudeStreamParser, LIMIT_TEXT } from "./brain";
 import { type CodexBrainEvent, CodexThreads, chatFolder, codexProfileOf, codexThreadKey } from "./brain-codex";
 import { cursorPrompt } from "./brain-cursor";
+import { ConsoleDecoder } from "./console-text";
 import { RunnerError } from "./errors";
 import { killTree } from "./exec";
 import { cliSpawn, GROK_BIN } from "./executors";
@@ -388,7 +389,8 @@ export interface GrokTurnOptions {
 export async function runGrokTurn(input: GrokTurnInput, opts: GrokTurnOptions): Promise<void> {
   const fail = (code: string, message: string, retryable?: boolean) =>
     opts.emit({ type: "error", code, message, ...(retryable ? { retryable } : {}) });
-  const windows = (opts.platform ?? process.platform) === "win32";
+  const platform = opts.platform ?? process.platform;
+  const windows = platform === "win32";
   try {
     writeGrokConfig(
       input.account.home,
@@ -406,7 +408,7 @@ export async function runGrokTurn(input: GrokTurnInput, opts: GrokTurnOptions): 
     ...(opts.socketPath ? { [CODEX_MCP_ENV[1]]: opts.socketPath } : {}),
     ...(opts.runnerHome ? { [CODEX_MCP_ENV[2]]: opts.runnerHome } : {}),
   };
-  const env = accountEnv("grok", input.account.home, base);
+  const env = accountEnv("grok", input.account.home, base, platform);
   const clean = (text: string) => (opts.redact ? opts.redact(text) : text);
   const hold = opts.redact ? (opts.redactHold ?? 0) : 0;
 
@@ -439,7 +441,7 @@ export async function runGrokTurn(input: GrokTurnInput, opts: GrokTurnOptions): 
     parser.beginTurn();
     let child: ChildProcess;
     try {
-      const run = cliSpawn([opts.bin ?? GROK_BIN], args, env.PATH, opts.platform);
+      const run = cliSpawn([opts.bin ?? GROK_BIN], args, env.PATH, platform);
       child = (opts.spawn ?? spawn)(run.file, run.args, {
         cwd: input.cwd,
         env: run.env ? { ...env, ...run.env } : env,
@@ -454,8 +456,9 @@ export async function runGrokTurn(input: GrokTurnInput, opts: GrokTurnOptions): 
       return fail("grok_failed", err instanceof Error ? err.message : String(err));
     }
     let stderr = "";
+    const stderrText = new ConsoleDecoder();
     child.stderr?.on("data", (c: Buffer) => {
-      stderr = (stderr + c.toString("utf8")).slice(-2000);
+      stderr = (stderr + stderrText.write(c)).slice(-2000);
     });
     let tail = "";
     let streamed = false;

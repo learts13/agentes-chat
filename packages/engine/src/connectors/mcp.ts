@@ -1,15 +1,17 @@
 import { type ComposioClient, composioFile, FileTooLargeError } from "@agenteschat/adapters";
+import type { ToolImage } from "@agenteschat/providers";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { FetchLike, Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { jsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/types.js";
-import { ARTIFACT_LIMITS, type ArtifactDeps, createFileArtifact, fileReach } from "../artifacts";
+import { ARTIFACT_LIMITS, type ArtifactDeps, createFileArtifact, fileBytesOf, fileReach } from "../artifacts";
 import { recordAudit } from "../audit";
 import { runAuthorityById } from "../authority";
+import { MODEL_IMAGE_BYTES, sniffModelImage } from "../avatars";
 import { CONFIDENTIAL_META_KEY } from "../confidential";
 import { connectorKeyOf } from "../connector-usage";
 import { signJwtHs256 } from "../crypto";
-import { cutText } from "../format";
+import { cutText, formatBytes } from "../format";
 import { type GitHubAppAccess, githubCallAuth, githubListingHeaders } from "../git/github-call";
 import { githubItemOfCall, recordGitHubItem } from "../git/github-events";
 import { creditedMessage, runCoAuthors, signatureLine, signedBody } from "../git/signature";
@@ -22,7 +24,7 @@ import type { ToolContext, ToolDefinition, ToolSource } from "../tools/types";
 import { untrustedBlock } from "../untrusted";
 import { CONNECTOR_CATALOG, type ConnectorTool, connectorScope, fillTitle } from "./catalog";
 import { sqlArgOf } from "./classify";
-import { composioFailure, composioServiceOf } from "./composio";
+import { composioFailure, composioFileArgs, composioServiceOf } from "./composio";
 import {
   activeConnections,
   type ConnectorConnection,
@@ -47,7 +49,7 @@ import {
 } from "./custom";
 import { auditLabel, personalTool, usableConnections } from "./personal";
 import { applyToolPins } from "./pins";
-import { presetForServer } from "./presets";
+import { type ComposioWay, composioAction, presetForServer } from "./presets";
 import type { McpServerInfo } from "./server-icon";
 
 /** A tool as an MCP server lists it. */
@@ -64,6 +66,8 @@ export interface McpTool {
 export interface McpCallResult {
   content: string;
   isError: boolean;
+  /** The result's `image` blocks the model is shown (`mcpPictures`). */
+  images?: ToolImage[];
   /** A Composio action's answer as Composio gave it (files and all), for `keepComposioFiles`. */
   data?: unknown;
   /** The result's own `_meta`, as the server sent it: what it says of its answer beside the content. */
@@ -107,6 +111,42 @@ const NO_OUTPUT_VALIDATION: jsonSchemaValidator = {
   getValidator: () => (input) => ({ valid: true, data: input as never, errorMessage: undefined }),
 };
 
+type McpContent = { type: string; text?: string; data?: unknown; mimeType?: unknown; resource?: { text?: unknown } };
+
+/**
+ * A result's `image` blocks as pictures for the model, up to `MODEL_IMAGE_BYTES` in all, each typed by its own bytes
+ * (the APIs refuse one sent under another type), and the words standing in each block's place, by its index.
+ */
+function mcpPictures(content: McpContent[]): { images: ToolImage[]; notes: Map<number, string> } {
+  const images: ToolImage[] = [];
+  const notes = new Map<number, string>();
+  let total = 0;
+  content.forEach((c, i) => {
+    if (c.type !== "image" || typeof c.data !== "string") return;
+    const bytes = Buffer.from(c.data, "base64");
+    const type = sniffModelImage(bytes);
+    if (!type) {
+      notes.set(
+        i,
+        `[image${typeof c.mimeType === "string" ? ` (${c.mimeType})` : ""}: not a PNG, JPEG, GIF or WebP, so not shown to you]`,
+      );
+      return;
+    }
+    if (total + bytes.byteLength > MODEL_IMAGE_BYTES) {
+      notes.set(
+        i,
+        `[image of ${formatBytes(bytes.byteLength)}: past the ${formatBytes(MODEL_IMAGE_BYTES)} of pictures an AI is shown at once, so not shown to you]`,
+      );
+      return;
+    }
+    total += bytes.byteLength;
+    // Encoded again: a server may wrap its base64 in lines, which an API refuses.
+    images.push({ mediaType: type, data: bytes.toString("base64") });
+    notes.set(i, "[image: shown to you with this result]");
+  });
+  return { images, notes };
+}
+
 /** Wraps an official MCP SDK client over any transport. */
 export async function mcpSessionOver(transport: Transport): Promise<McpSession> {
   const client = new Client({ name: "agentes.chat", version: "1" }, { jsonSchemaValidator: NO_OUTPUT_VALIDATION });
@@ -133,21 +173,27 @@ export async function mcpSessionOver(transport: Transport): Promise<McpSession> 
     },
     async callTool(name, args, meta) {
       const res = (await client.callTool({ name, arguments: args, ...(meta ? { _meta: meta } : {}) })) as {
-        content?: { type: string; text?: string; resource?: { text?: unknown } }[];
+        content?: McpContent[];
         isError?: boolean;
         structuredContent?: unknown;
         _meta?: Record<string, unknown>;
       };
+      const pictures = mcpPictures(res.content ?? []);
       // GitHub's `get_file_contents` sends the file itself as an embedded resource next to a one-line text block.
-      const parts = (res.content ?? []).map((c) =>
+      const parts = (res.content ?? []).map((c, i) =>
         c.type === "text"
           ? (c.text ?? "")
           : c.type === "resource" && typeof c.resource?.text === "string"
             ? c.resource.text
-            : `[${c.type}]`,
+            : (pictures.notes.get(i) ?? `[${c.type}]`),
       );
       if (parts.length === 0 && res.structuredContent !== undefined) parts.push(JSON.stringify(res.structuredContent));
-      return { content: parts.join("\n"), isError: res.isError === true, ...(res._meta ? { meta: res._meta } : {}) };
+      return {
+        content: parts.join("\n"),
+        isError: res.isError === true,
+        ...(pictures.images.length > 0 ? { images: pictures.images } : {}),
+        ...(res._meta ? { meta: res._meta } : {}),
+      };
     },
     serverInfo: () => (client.getServerVersion() as McpServerInfo | undefined) ?? null,
     instructions: () => client.getInstructions() ?? null,
@@ -453,7 +499,7 @@ export function createConnectorToolSource(
 
   /**
    * What the agent writes to GitHub, signed (ADR 0156): a body ends with its line naming the agent and the person it
-   * works for, a commit message with the agent's own `Co-authored-by` and that person's. The approval card showed the
+   * works for, a commit message with the agent's own `Co-Authored-By` and that person's. The approval card showed the
    * agent's own words.
    */
   async function signed(
@@ -608,9 +654,32 @@ export function createConnectorToolSource(
         execute: async (input, ctx) => {
           // Never through Composio: no server at its address ever reads a request of ours.
           const meta = composio ? undefined : await callerStatement(connection, ctx);
+          let args = input;
+          if (composio && deps.composio) {
+            const client = deps.composio.client;
+            let prepared: Awaited<ReturnType<typeof uploadComposioFiles>>;
+            try {
+              prepared = await uploadComposioFiles(
+                { client, artifacts: deps.artifacts },
+                ctx,
+                composio.way,
+                tool,
+                input,
+              );
+            } catch (error) {
+              return composioFailure(deps, connection, error);
+            }
+            if (typeof prepared === "string")
+              return {
+                content: prepared,
+                isError: true,
+                data: { connector: "custom", serverId: connection.id, tool: tool.name, isError: true },
+              };
+            args = prepared;
+          }
           let result: McpCallResult;
           try {
-            result = await withSession(connection, (s) => s.callTool(tool.name, input, meta));
+            result = await withSession(connection, (s) => s.callTool(tool.name, args, meta));
           } catch (error) {
             if (!composio) throw error;
             return composioFailure(deps, connection, error);
@@ -641,6 +710,7 @@ export function createConnectorToolSource(
           return {
             content: result.content,
             isError: result.isError,
+            ...(result.images ? { images: result.images } : {}),
             data: { connector: "custom", serverId: connection.id, tool: tool.name, isError: result.isError },
             // Only a listed server's word counts: any other could lock a run by saying so.
             ...(vouched && result.meta?.[CONFIDENTIAL_META_KEY] === true ? { confidential: true as const } : {}),
@@ -730,6 +800,7 @@ export function createConnectorToolSource(
           return {
             content: result.content,
             isError: result.isError,
+            ...(result.images ? { images: result.images } : {}),
             data: { connector: def.id, tool: tool.name, isError: result.isError },
             ...(mapped.onSuccess && !result.isError
               ? {
@@ -748,6 +819,54 @@ export function createConnectorToolSource(
     }
     return out;
   }
+}
+
+const DRIVE_ID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+/**
+ * A Composio action's file arguments (`composioFileArgs`), from the Drive file ids the agent gave to what the action
+ * takes: each file the agent may read, sent to Composio's storage as it is. A string is the answer to show instead,
+ * nothing having run: a path, an id that isn't a file it may read.
+ */
+export async function uploadComposioFiles(
+  deps: { client: Pick<ComposioClient, "uploadFile">; artifacts?: ArtifactDeps },
+  ctx: ToolContext,
+  way: ComposioWay,
+  tool: { name: string; inputSchema?: unknown },
+  input: Record<string, unknown>,
+): Promise<Record<string, unknown> | string> {
+  const names = composioFileArgs(tool.inputSchema).filter((n) => typeof input[n] === "string");
+  if (names.length === 0) return input;
+  const slug = composioAction(way, tool.name);
+  if (!slug || !deps.artifacts) return "Files can't be uploaded from this server.";
+  const actor = {
+    type: "agent" as const,
+    agentId: ctx.agentId,
+    channelId: ctx.channelId,
+    threadId: replyThreadOf(ctx),
+    runId: ctx.runId,
+  };
+  const out = { ...input };
+  for (const name of names) {
+    const given = String(input[name]).trim();
+    const id = DRIVE_ID.exec(given)?.[0];
+    if (!id)
+      return `${name} takes a file of the workspace's Drive by its id, and "${cutText(given, 80)}" isn't one. A file on your computer goes to the Drive first with upload_file, which answers with its id. Nothing was uploaded.`;
+    let file: Awaited<ReturnType<typeof fileBytesOf>>;
+    try {
+      file = await fileBytesOf({ ...deps.artifacts, db: ctx.db }, actor, ctx.orgId, id);
+    } catch (error) {
+      return `File ${id} can't be uploaded: ${error instanceof Error ? error.message : "it isn't a file you can read"}. Nothing was uploaded.`;
+    }
+    out[name] = await deps.client.uploadFile({
+      toolkit: way.toolkit,
+      slug,
+      name: file.name,
+      mimetype: file.contentType || "application/octet-stream",
+      data: file.bytes,
+    });
+  }
+  return out;
 }
 
 /** What marks a file in a Composio answer: a short-lived download link, or the file's bytes inline. */

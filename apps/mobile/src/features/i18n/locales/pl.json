@@ -885,6 +885,7 @@
   },
   "agent": {
     "talk": "Czat",
+    "responsible": "Odpowiedzialna osoba",
     "task": "Zadanie",
     "owner": "właściciel: {{name}}",
     "cantTalk": "Ten agent nie pracuje z tobą.",
@@ -3050,11 +3051,12 @@
     },
     "formatAuto": "{{name}} wybiera najlepszą",
     "newWidget": {
-      "alerts": "Alert włączony",
       "realData": "Prawdziwe dane",
       "editAsk": "Zmień prośbę",
       "asked": "„{{ask}}”",
-      "autoFormat": "Forma automatyczna"
+      "testReal": "Testuj na prawdziwych danych",
+      "addHome": "Dodaj do Startu",
+      "addTo": "Dodaj do: {{where}}"
     },
     "agentPick": {
       "search": "Szukaj agentów",
@@ -3528,7 +3530,8 @@
       "workspaceSub": "Klucz API workspace'u",
       "key": "Klucz API",
       "keyDefault": "domyślny workspace'u",
-      "api": "API"
+      "api": "API",
+      "asksMove": "{{agent}} przestaje z niego korzystać."
     },
     "missionAi": "AI",
     "missionLocked": "Kto wykonuje pracę, wybiera się przed startem. Model można zmienić w każdej chwili."

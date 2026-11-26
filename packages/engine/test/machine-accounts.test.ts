@@ -7,6 +7,7 @@ import {
   accountCodeAad,
   BRAIN_PROTOCOL,
   CLAUDE_AUTH_PROTOCOL,
+  CLI_COPIES_PROTOCOL,
   GROK_WINDOWS_PROTOCOL,
   generateSecretKeyPair,
   type MachineRequest,
@@ -676,7 +677,7 @@ test("a coding plan's key: no sign-in page but the plan's key page, the key seal
     .set({
       execAllowed: true,
       executors: {
-        claude: { version: "2.1.0", loggedIn: true, plan: "max" },
+        claude: { version: "2.1.300", loggedIn: true, plan: "max" },
         ownUsage: { claude_code: usage },
         detectedAt: new Date().toISOString(),
       },
@@ -692,8 +693,30 @@ test("a coding plan's key: no sign-in page but the plan's key page, the key seal
     .update(schema.machines)
     .set({
       executors: {
-        claude: { version: "2.1.0", loggedIn: false },
+        claude: { version: "2.1.300", loggedIn: false },
         ownUsage: { claude_code: usage },
+        detectedAt: new Date().toISOString(),
+      },
+    })
+    .where(eq(schema.machines.id, machineId));
+  expect((await listAiAccounts({ db: f.db }, f.owner.id, f.org.id)).computers[0]?.own).toEqual({});
+  // Codex's own sign-in as its runner reads it (an API key, or a model provider of its own config), usage or not.
+  await f.db
+    .update(schema.machines)
+    .set({
+      executors: {
+        codex: { version: "codex-cli 0.169.0", loggedIn: true, authMethod: "provider" },
+        detectedAt: new Date().toISOString(),
+      },
+    })
+    .where(eq(schema.machines.id, machineId));
+  expect((await listAiAccounts({ db: f.db }, f.owner.id, f.org.id)).computers[0]?.own).toEqual({ codex: {} });
+  await f.db
+    .update(schema.machines)
+    .set({
+      executors: {
+        codex: { version: "codex-cli 0.169.0", loggedIn: false },
+        ownUsage: { codex: usage },
         detectedAt: new Date().toISOString(),
       },
     })
@@ -1556,6 +1579,35 @@ test("the agent's account: its owner's own only, on its computer, of its brain's
   });
 });
 
+test("an admin connects a plan of their own for another member's agent; a plain member can't", async () => {
+  f = await setup();
+  const { machineId } = await sharedMachine();
+  const caio = await addMember(f.db, f.org.id, "member", "caio");
+  const admin = await addMember(f.db, f.org.id, "admin", "bia");
+  const dora = await addMember(f.db, f.org.id, "member", "dora");
+  await f.db
+    .update(schema.agents)
+    .set({ ownerUserId: caio.id, machineId, brain: "claude_code" })
+    .where(eq(schema.agents.id, f.agent.id));
+  const deps = { db: f.db };
+
+  // Caio's agent, on a computer everyone adds accounts to: the admin may sign a plan in there for it.
+  expect(await getAgentBrain(deps, admin.id, f.org.id, f.agent.id)).toMatchObject({
+    canManageAccounts: true,
+    canUsePlans: false,
+  });
+  await addAccount(machineId, CLAUDE_ID, "claude_code", { createdBy: admin.id, email: "bia@example.com" });
+  const saved = await setAgentBrain(deps, admin.id, f.org.id, f.agent.id, { brain: "claude_code", account: CLAUDE_ID });
+  expect(saved.account).toBe(CLAUDE_ID);
+  expect((await agentRow()).brainAccountLentBy).toBe(admin.id);
+
+  // Someone who neither owns nor manages it sees nothing of it and changes nothing.
+  const seen = await getAgentBrain(deps, dora.id, f.org.id, f.agent.id).catch((e) => e);
+  expect(seen).toBeInstanceOf(ForbiddenError);
+  const set = await setAgentBrain(deps, dora.id, f.org.id, f.agent.id, { account: null }).catch((e) => e);
+  expect(set).toBeInstanceOf(ForbiddenError);
+});
+
 test("a runner older than accounts: the page says accounts aren't supported", async () => {
   f = await setup();
   const { machineId } = await ownedMachine(BRAIN_PROTOCOL);
@@ -1785,14 +1837,19 @@ test("Grok signs in on Windows from GROK_WINDOWS_PROTOCOL on; an older Windows r
   await expect(begin(GROK_WINDOWS_PROTOCOL - 1)).rejects.toMatchObject({ code: "account.runner_old" });
 });
 
-test("Cursor doesn't sign in on a Windows computer: refused before the runner is asked (issue #156)", async () => {
+test("Cursor on a Windows computer signs in from `CLI_COPIES_PROTOCOL`; an older runner is too old, never asked (issue #156)", async () => {
   f = await setup();
   const { machineId } = await ownedMachine(SHARED_GROK_PROTOCOL);
   await f.db.update(schema.machines).set({ os: "windows" }).where(eq(schema.machines.id, machineId));
   const runner = fakeHub(machineId, () => ({ url: "https://cursor.com/device" }), { protocol: SHARED_GROK_PROTOCOL });
   const refused = await beginAccountLogin(runner.deps, f.owner.id, f.org.id, machineId, "cursor").catch((e) => e);
-  expect(refused).toMatchObject({ code: "account.system", params: { program: "Cursor" } });
+  expect(refused).toMatchObject({ code: "account.runner_old" });
   expect(runner.calls).toEqual([]);
+  // Its runner keeps each Cursor account's sign-in in its folder there (ADR 0228 §7).
+  await f.db.update(schema.machines).set({ protocol: CLI_COPIES_PROTOCOL }).where(eq(schema.machines.id, machineId));
+  const now = fakeHub(machineId, () => ({ url: "https://cursor.com/device" }), { protocol: CLI_COPIES_PROTOCOL });
+  await beginAccountLogin(now.deps, f.owner.id, f.org.id, machineId, "cursor");
+  expect(now.calls[0]).toMatchObject({ op: "account", action: "begin", kind: "cursor" });
 });
 
 test("one sign-in for all agents (protocol 29): asked for, it thinks for two agents, once; out and gone for both", async () => {
@@ -2262,15 +2319,27 @@ test("a new Claude sign-in for all agents takes the policy's method once; signin
   expect(status).toMatchObject({ state: "done" });
   expect(await accountRow(login.loginId)).toMatchObject({ authMethod: "setup_token", status: "active" });
 
-  // The policy moves this workspace to Claude's own login: a runner that can't is refused, with nothing left behind.
+  // The policy moves this workspace to Claude's own login: a runner not ready for it yet signs this one in with a
+  // token, kept on its row, and the operators hear why.
   await setClaudeAuthPolicy(f.db, { method: "cli_login", rollout: "selected", orgIds: [f.org.id] });
-  const before = (await accountRows(machineId)).length;
-  const refused = fakeHub(machineId, () => ({ url: "https://claude.ai/x" }), over);
-  const error = await beginAccountLogin(refused.deps, f.owner.id, f.org.id, machineId, "claude_code").catch((e) => e);
+  const errors: unknown[][] = [];
+  const log = { error: (...a: unknown[]) => void errors.push(a), warn: () => {} };
+  const fallback = fakeHub(machineId, () => ({ url: "https://claude.ai/x" }), over);
+  const token = await beginAccountLogin({ ...fallback.deps, log }, f.owner.id, f.org.id, machineId, "claude_code");
+  expect(fallback.calls[0]).toMatchObject({ action: "begin", shared: true, method: "setup_token" });
+  expect(await accountRow(token.loginId)).toMatchObject({ authMethod: "setup_token", status: "signing_in" });
+  expect(errors).toHaveLength(1);
+  expect(errors[0]?.[1]).toMatchObject({ machineId, reason: "pending" });
+
+  // One that offers neither is refused, with nothing left behind.
+  const { machineId: none } = await systemMachine(CLAUDE_AUTH_PROTOCOL, []);
+  const before = (await accountRows(none)).length;
+  const refused = fakeHub(none, () => ({ url: "https://claude.ai/x" }), over);
+  const error = await beginAccountLogin(refused.deps, f.owner.id, f.org.id, none, "claude_code").catch((e) => e);
   expect(error).toBeInstanceOf(ConflictError);
   expect(error).toMatchObject({ code: "account.method_unsupported" });
   expect(refused.calls).toEqual([]);
-  expect((await accountRows(machineId)).length).toBe(before);
+  expect((await accountRows(none)).length).toBe(before);
 
   // Signing in again keeps the account's own method, whatever the policy says now.
   await f.db
@@ -2301,12 +2370,12 @@ test("a runner that can use Claude's own login for all agents gets it; an older 
   expect(runner.calls[0]).toMatchObject({ shared: true, method: "cli_login" });
   expect(await accountRow(login.loginId)).toMatchObject({ authMethod: "cli_login", status: "signing_in" });
 
-  // Below protocol 50 in system mode: setup-token is all it does, so the policy's own login is refused.
+  // Below protocol 50 in system mode: setup-token is all it does, so that is what the policy's own login gets.
   const { machineId: old } = await systemMachine(SHARED_ACCOUNTS_PROTOCOL, ["cli_login"]);
   const oldRunner = fakeHub(old, () => ({ url: "https://claude.ai/x" }), { protocol: SHARED_ACCOUNTS_PROTOCOL });
-  await expect(beginAccountLogin(oldRunner.deps, f.owner.id, f.org.id, old, "claude_code")).rejects.toMatchObject({
-    code: "account.method_unsupported",
-  });
+  const older = await beginAccountLogin(oldRunner.deps, f.owner.id, f.org.id, old, "claude_code");
+  expect(oldRunner.calls[0]).not.toHaveProperty("method");
+  expect(await accountRow(older.loginId)).toMatchObject({ authMethod: "setup_token" });
   await setClaudeAuthPolicy(f.db, { method: "setup_token", rollout: "selected", orgIds: [] });
   const legacy = signingRunner(old, () => ({ loggedIn: true, shared: true }), { protocol: SHARED_ACCOUNTS_PROTOCOL });
   const kept = await beginAccountLogin(legacy.deps, f.owner.id, f.org.id, old, "claude_code");

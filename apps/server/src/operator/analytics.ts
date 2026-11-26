@@ -120,6 +120,23 @@ const Analytics = z
             description:
               "Composio connected accounts made this month (mailboxes), reconnects included: Composio bills each once past the free ones.",
           }),
+          orgs: z
+            .array(
+              z.object({
+                orgId: z.uuid(),
+                connectors: z
+                  .array(z.object({ connector: Key, label: Label }))
+                  .openapi({ description: "Its Composio connectors this month: called, billed or connected." }),
+                calls: Count.openapi({ description: "Its calls of Composio's tools." }),
+                errors: Count,
+                ...ComposioCounts,
+                connections: Count.openapi({ description: "Its connected accounts made this month." }),
+              }),
+            )
+            .openapi({
+              description: `Per workspace with a call or something billed this month, most executions first (then events, calls and connections), at most ${ANALYTICS_ROWS_MAX}.`,
+            }),
+          orgsMore: z.boolean().openapi({ description: "More workspaces than were listed." }),
         })
         .openapi({ description: "This month whatever the dates: Composio's free allowances are monthly." }),
     }),
@@ -482,7 +499,7 @@ const RunTimings = z
           ...TimingsGroup,
           cause: z.string().openapi({
             description:
-              "Why the turn started a new process: `new_session` (a session that never ran there: a new conversation, or a fresh session for an old one), `idle` (its process closed after its idle limit), `cap` (closed for another conversation of the agent), `memory` (closed to make room), `settings` (another launch: folder, permissions, account, sign-in), `warm_mismatch` (a warm start had another system text), `exited`, `closed` (after its last turn: canceled, died, a background turn), `restart` (it ran before, no process left: the runner restarted), `unsaid` (an older runner). Ignore values you don't know.",
+              "Why the turn started a new process: `new_session` (a session that never ran there: a new conversation, or a fresh session for an old one), `idle` (its process closed after its idle limit), `cap` (closed for another conversation of the agent), `memory` (closed to make room), `settings` (another launch: folder, permissions, account, sign-in), `warm_mismatch` (a warm start had another system text), `exited`, `closed` (after its last turn: canceled, died, a background turn), `restart` (it ran before, no process left: the runner restarted), `warm_settings` (a warm start had another launch than its turn), `no_launch` (a warm start came before the runner ran a turn of the agent), `unsaid` (an older runner). Ignore values you don't know.",
           }),
           turns: Count,
         }),

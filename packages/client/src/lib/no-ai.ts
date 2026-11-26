@@ -1,3 +1,4 @@
+import { CLI_UPDATE_COMMAND } from "@agenteschat/providers/cli-floors";
 import type { TFunction } from "i18next";
 import type {
   Agent,
@@ -207,6 +208,39 @@ export function keptCardState(s: { hold: BillingHold | null; paid: boolean; read
 export const planLineKey = (line: RightHandPlanLine, why?: string) =>
   line === "cli_failed" && why ? ("noAi.rightHand.cli_failedWhy" as const) : (`noAi.rightHand.${line}` as const);
 
+/** A missing piece's sentence (it names the agent): Connect is still the way out. */
+const MISSING_LINES = {
+  cli_missing: "noAi.cliMissing",
+  no_computer: "noAi.noComputer",
+  not_signed_in: "noAi.signedOut",
+} as const;
+
+/**
+ * Under a message one agent won't answer for want of an AI (`why`: its run's reason, the receipt's `failures` entry):
+ * what is really in the way, filled with `agentGrammar(name)` and `model`. A plan it has that can't think now (its
+ * computer, its CLI, its limit) says so, with no Connect (`connect` false): picking an account again changes nothing,
+ * and its card in the conversation has the way out. A plan that doesn't serve this person keeps Connect, for their own.
+ * A missing piece (the CLI, a computer, a sign-in) says which, and Connect stays. Null: "falta uma IA".
+ */
+export function noAiReceiptLine(why: { code: string; params?: Record<string, string> } | undefined): {
+  key: ReturnType<typeof planLineKey> | (typeof MISSING_LINES)[keyof typeof MISSING_LINES];
+  model?: string;
+  connect: boolean;
+} | null {
+  if (!why) return null;
+  if (Object.hasOwn(MISSING_LINES, why.code))
+    return { key: MISSING_LINES[why.code as keyof typeof MISSING_LINES], connect: true };
+  // Whose the plans are comes from the AI status (`plansNotYoursOf`).
+  if (!RIGHT_HAND_PLAN_LINES.has(why.code) || why.code === "plans_not_yours") return null;
+  const model = why.params?.model;
+  if (why.code.startsWith("model_") && !model) return null;
+  return {
+    key: planLineKey(why.code as RightHandPlanLine),
+    ...(model ? { model } : {}),
+    connect: why.code === "plan_not_shared",
+  };
+}
+
 /** A plan line that passes by itself: once the agent can think again, its card offers "Responder agora". */
 export const planLinePasses = (line: RightHandPlanLine | undefined) =>
   line === "computer_away" || line === "computer_failed" || line === "cli_failed" || line === "plans_not_yours";
@@ -255,6 +289,14 @@ export const mayConnectAi = (
   meId: string | null | undefined,
   org: Parameters<typeof can>[0],
 ) => (!!meId && isRightHand(agent)) || maySetAgentAi(agent, meId, org);
+
+/**
+ * Whom Connect signs a plan in for, of the agents it was opened for: the person's own, the right hand (everyone's, ADR
+ * 0137 §11) and one they manage, with a plan of their own lent to it. Someone else's agent they don't manage gets who
+ * connects it instead (`noAiLockedLine`).
+ */
+export const connectsPlanFor = (agent: ConnectingAgent | null | undefined, meId: string | null | undefined) =>
+  !!agent && ((!!meId && agent.ownerUserId === meId) || isRightHand(agent) || managesAgent(agent));
 
 /**
  * The way out of a plan line for this person: their own plan when the workspace's doesn't serve them, or when a key
@@ -444,7 +486,10 @@ export type PlanGate =
       /** `reason` "system": the computer's system, which the picker names before a plan is picked. */
       os?: string;
     }
-  /** `owner`: the viewer doesn't own the agent; `computer`: only whoever connected it adds a sign-in there. */
+  /**
+   * `owner`: the viewer doesn't own the agent and can't sign a plan of theirs in for it there; `computer`: only whoever
+   * connected it adds a sign-in there.
+   */
   | { state: "locked"; who: "owner" | "computer" }
   /** The Cloud's workspace is on a billing hold: it has no computer to sign in on until its agentes.chat plan is active. */
   | { state: "billing"; hold: BillingHold }
@@ -515,7 +560,8 @@ export function planGate({
   if (hold) return { state: "billing", hold };
   if (edition === "cloud" && setupPending(setup)) return { state: "preparing", view: setup };
   if (!brain || !edition) return { state: "loading" };
-  if (!brain.canUsePlans) return { state: "locked", who: "owner" };
+  // Who manages someone else's agent signs a plan of their own in for it wherever they may add one (`canManageAccounts`).
+  if (!brain.canUsePlans && !brain.canManageAccounts) return { state: "locked", who: "owner" };
   if (!brain.computer)
     return edition === "cloud" && !caughtUp ? { state: "preparing", view: null } : { state: "missing" };
   if (!brain.computer.online) return { state: "offline" };
@@ -620,6 +666,27 @@ export const gateRechecks = (gate: PlanGate, edition: Edition | null) =>
     !gate.overdue &&
     (gate.reason === "not_reported" || (edition === "cloud" && gate.reason !== "tool_off")));
 
+/**
+ * How long the server's own computer may take to connect the first time: its runner asks for its token every minute
+ * (`agentes-runner host`), the desktop app at once when the site tells it of a new workspace and every five minutes
+ * otherwise. Past this, it is offline like any other computer.
+ */
+export const HOST_CONNECT_WAIT_MS = 5 * 60_000;
+
+/**
+ * The server's own computer (ADR 0060 §3), added with a new workspace and not connected yet: its row exists before the
+ * runner here gets its token, so a plan's panel says it is connecting, with its steps waiting, instead of offline.
+ */
+export const hostConnecting = (
+  gate: PlanGate,
+  machine: Pick<Machine, "kind" | "lastSeenAt" | "createdAt"> | null | undefined,
+  now = Date.now(),
+) =>
+  gate.state === "offline" &&
+  machine?.kind === "host" &&
+  machine.lastSeenAt === null &&
+  now - Date.parse(machine.createdAt) < HOST_CONNECT_WAIT_MS;
+
 /** The Cloud's line per reason a plan can't sign in on the workspace's computer (`aiAccounts.connect.needsCloud.*`). */
 const CLOUD_REASON = {
   no_computer: "preparing",
@@ -634,6 +701,8 @@ const CLOUD_REASON = {
   system: "stuck",
   windows_sandbox: "stuck",
   cant_start: "stuck",
+  // The Cloud's programs are updated with its image: said as being updated.
+  cli_outdated: "installing",
 } as const satisfies Record<BrainUnavailable | "keys", string>;
 
 /**
@@ -706,6 +775,16 @@ export function gateLine(
     if (said === CLI_HOME_ONLY) return { text: t("brain.reasons.home_only", words), rechecks };
     if (said === CLI_GIT_MISSING) return { text: t("connectAi.cli.gitMissing", words), rechecks };
     if (said) return { text: t("connectAi.cli.cantStart", { ...words, message: said }), rechecks };
+  }
+  // Too old for agentes.chat, or a blocked version: with the command that updates it where its own updater is the way.
+  if (gate.reason === "cli_outdated") {
+    const command = CLI_UPDATE_COMMAND[kind === "claude_code" ? "claude" : kind];
+    return {
+      text: command
+        ? t("brain.reasons.cli_outdatedRun", { computer, program, command })
+        : t("brain.reasons.cli_outdated", { computer, program }),
+      rechecks,
+    };
   }
   return { text: t(`brain.reasons.${gate.reason}`, { computer, program }), rechecks };
 }

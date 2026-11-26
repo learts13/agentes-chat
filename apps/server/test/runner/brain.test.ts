@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
   copyFileSync,
+  existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -11,6 +12,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { INLINE_CODE_DENY_RULES, PUSH_ASK_RULES } from "@agenteschat/adapters/command-policy";
 import {
@@ -564,6 +566,19 @@ test("parser: a failed turn says why the provider failed it, from Claude Code's 
   expect(
     fail(errorFrame("invalid_request", disabled), { type: "result", is_error: true, result: disabled }),
   ).toMatchObject({ code: "claude_failed", cause: "account_disabled", httpStatus: 400 });
+  // A model the sign-in or its endpoint doesn't serve: the model's, never the sign-in's, and no retry on it.
+  const noModel =
+    "There's an issue with the selected model (claude-x). It may not exist or you may not have access to it.";
+  expect(fail({ type: "result", is_error: true, result: noModel })).toMatchObject({
+    code: "claude_failed",
+    cause: "model_unavailable",
+    retryable: false,
+  });
+  const notFound = 'API Error: 404 {"type":"error","error":{"type":"not_found_error","message":"model: claude-x"}}';
+  expect(fail({ type: "result", is_error: true, result: notFound })).toMatchObject({
+    cause: "model_unavailable",
+    httpStatus: 404,
+  });
   expect(
     fail(errorFrame("billing_error", "Credit balance is too low"), {
       type: "result",
@@ -1698,6 +1713,19 @@ test.if(posix)(
   },
 );
 
+test.if(posix)("each CLI process has a temp folder of its own, gone with the process", async () => {
+  const { spawns, turn } = setup();
+  const logged = () => spawns() as unknown as { tmpdir: string | null }[];
+  await turn(1, "first", { timeZone: "America/Sao_Paulo" });
+  await turn(2, "second", { timeZone: "Asia/Tokyo" });
+  const [first, second] = logged().map((l) => l.tmpdir ?? "");
+  expect(path.dirname(first ?? "")).toBe(os.tmpdir());
+  expect(path.basename(first ?? "")).toStartWith("agentes-run-");
+  expect(second).not.toBe(first);
+  expect(existsSync(second ?? "")).toBe(true);
+  await waitFor(() => !existsSync(first ?? ""), 4000);
+});
+
 test.if(posix)(
   "the turn's zone is the CLI's TZ, so its date is the person's; a turn in another zone restarts it, resumed",
   async () => {
@@ -1734,14 +1762,33 @@ test.if(posix)(
   },
 );
 
+test("parser: the first token is when the API's first message started, the first answer its first whole block", () => {
+  let now = 1_000;
+  const p = new ClaudeStreamParser(() => now);
+  p.beginTurn();
+  p.push(
+    line({ type: "stream_event", parent_tool_use_id: null, event: { type: "message_start", message: { id: "m1" } } }),
+  );
+  now += 50;
+  const block = {
+    type: "assistant",
+    message: { id: "m1", content: [{ type: "text", text: "hi" }] },
+    parent_tool_use_id: null,
+  };
+  p.push(line(block));
+  now += 50;
+  p.push(line(block));
+  expect(p.stats).toMatchObject({ firstTokenAt: 1_000, firstAssistantAt: 1_050 });
+});
+
 test.if(posix)("a turn's timings keep its API retries, its thinking and when the model first answered", async () => {
   const { turn } = setup();
   const r = await turn(1, "RETRYWAIT THOUGHT");
   expect(r.final).toMatchObject({ type: "done" });
   const t = r.final.type === "done" ? r.final.timings : undefined;
   expect(t).toMatchObject({ warm: false, retries: 1, retryDelayMs: 800, thinkingBlocks: 2, thinkingChars: 10 });
-  // The API's first message came 50 ms before its first whole block.
-  expect((t?.firstAssistantMs ?? 0) - (t?.firstTokenMs ?? 0)).toBeGreaterThanOrEqual(40);
+  // How far apart the two lines are read is the machine's pace: the parser's test above holds the clock.
+  expect(t?.firstAssistantMs).toBeGreaterThanOrEqual(t?.firstTokenMs ?? Number.NaN);
   // The next turn on the process counts its own.
   const next = await turn(2, "second");
   expect(next.final).toMatchObject({
@@ -1810,7 +1857,7 @@ test.if(posix)(
   "other lines for the agent's commits (turned off, the agent renamed) restart the process, resumed",
   async () => {
     const { spawns, turn } = setup();
-    const nick = { agent: { ...AGENT, coAuthors: ["Co-authored-by: Nick <noreply@agentes.chat>"] } };
+    const nick = { agent: { ...AGENT, coAuthors: ["Co-Authored-By: Nick <noreply@agentes.chat>"] } };
     await turn(1, "first", {}, undefined, nick);
     await turn(2, "second", {}, undefined, nick);
     expect(spawns()).toHaveLength(1);
@@ -3416,6 +3463,25 @@ test.if(posix)(
     expect(c.final).toMatchObject({ type: "done" });
     expect(spawns().map((s) => s.system)).toEqual(["S1", "S1", "S1", "S2"]);
     expect(spawns().at(-1)?.args.slice(-2)).toEqual(["--session-id", SESSION(3)]);
+  },
+);
+
+test.if(posix)(
+  "a warm start that came to nothing says why on its turn: no launch to start it with, another launch than the turn's",
+  async () => {
+    const { m, ws, turn } = setup();
+    const ctx = { agent: AGENT, folder: await agentWorkspace(ws, AGENT), emit: () => {} };
+    const warm = (n: number, model: string) =>
+      m.prewarm({ kind: "claude_code", session: { id: SESSION(n), resume: false }, cwd: "", model }, ctx);
+    const cold = (f: WireBrainEvent) => (f.type === "done" ? f.timings : undefined);
+    // Before this runner ran a turn of the agent's: no system text to start it with.
+    expect(await warm(1, "sonnet")).toEqual({ open: false, started: false });
+    const a = await turn(1, "hi", { system: "S1", model: "sonnet" });
+    expect(cold(a.final)).toMatchObject({ warm: false, cold: "no_launch" });
+    // Warmed for sonnet; the turn came with opus, whose `--fallback-model` only a start sets.
+    expect(await warm(2, "sonnet")).toEqual({ open: true, started: true });
+    const b = await turn(2, "there", { system: "S1", model: "opus", session: { id: SESSION(2), resume: false } });
+    expect(cold(b.final)).toMatchObject({ warm: false, cold: "warm_settings" });
   },
 );
 

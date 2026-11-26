@@ -1,4 +1,5 @@
 import { and, eq, inArray, isNull, or, schema, sql } from "@agenteschat/db";
+import { ROUTINE_PROMPT_MAX } from "@agenteschat/tokens/routines";
 import { type AgentActionParams, recordAgentActions } from "./agent-actions";
 import { routineRow, routineSnapshot } from "./agent-undo";
 import { agentsByHandle, currentHandles, getAgentCached } from "./agents";
@@ -12,6 +13,7 @@ import { schedulesOf } from "./context/summaries";
 import { ForbiddenError } from "./errors";
 import { cutText, stringsOf } from "./format";
 import { watchesFor } from "./mail/watches";
+import { relayedRefusal, relayedRequest } from "./requester";
 import { isRightHand } from "./right-hand";
 import { ROUTINE_REPORT, routineReportOf } from "./routine-brief";
 import { HOOK_METHODS, routineHookKeys } from "./routine-hooks";
@@ -670,7 +672,7 @@ export function createScheduleToolSource(deps: Omit<RoutineDeps, "db">): ToolSou
         properties: {
           schedule: SCHEDULE_INPUT,
           trigger: TRIGGER_SCHEMA,
-          prompt: { type: "string", minLength: 1, maxLength: 10_000 },
+          prompt: { type: "string", minLength: 1, maxLength: ROUTINE_PROMPT_MAX },
           title: { type: "string", maxLength: 120 },
           channel: { type: "string", maxLength: 100, description: "Report in this channel instead of here" },
           report: REPORT_SCHEMA,
@@ -690,6 +692,8 @@ export function createScheduleToolSource(deps: Omit<RoutineDeps, "db">): ToolSou
         try {
           const requester = await requesterOf(ctx);
           if (!requester) return noRequester;
+          // A routine is standing work, run again and again (ADR 0250): never set up from words relayed in.
+          if (await relayedRequest(ctx)) return relayedRefusal();
           const hasSchedule = Boolean(str(input.schedule).trim());
           const rawTrigger = input.trigger as Record<string, unknown> | undefined;
           if (hasSchedule === Boolean(rawTrigger)) {
@@ -869,7 +873,7 @@ export function createScheduleToolSource(deps: Omit<RoutineDeps, "db">): ToolSou
         properties: {
           id: { type: "string", minLength: 36, maxLength: 36 },
           channel: { type: "string", maxLength: 100 },
-          prompt: { type: "string", minLength: 1, maxLength: 10_000 },
+          prompt: { type: "string", minLength: 1, maxLength: ROUTINE_PROMPT_MAX },
           schedule: SCHEDULE_INPUT,
           trigger: TRIGGER_SCHEMA,
           title: { type: "string", minLength: 1, maxLength: 120 },
@@ -886,6 +890,7 @@ export function createScheduleToolSource(deps: Omit<RoutineDeps, "db">): ToolSou
         try {
           const requester = await requesterOf(ctx);
           if (!requester) return noRequester;
+          if (await relayedRequest(ctx)) return relayedRefusal();
           const id = str(input.id);
           const own = await ownRoutine(ctx, id, true);
           if (!own.row) return { content: own.error, isError: true };

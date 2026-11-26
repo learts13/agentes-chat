@@ -152,6 +152,7 @@ import type {
   GifCategory,
   GifKey,
   InstallableCli,
+  IntegrationAppInput,
   Invitation,
   InvitationWithStatus,
   InviteBatch,
@@ -1715,6 +1716,11 @@ export const useChannelMembers = (orgId: string, channelId: string, enabled = tr
 
 /** Messages per page: the latest page, then older pages on scroll-up. */
 export const MESSAGES_PAGE = 100;
+/**
+ * A conversation's next page loads while this many screens are still left to scroll, web and phone: asked for only at
+ * its edge, a quick scroll stopped there and waited for it.
+ */
+export const PAGE_AHEAD_SCREENS = 3;
 /** A thread's root and replies, in one read. */
 export const THREAD_PAGE = 200;
 
@@ -5913,6 +5919,18 @@ export const useRoutineRuns = (orgId: string, id: string | null) => {
   });
 };
 
+/** The calls one webhook routine run carried, as kept: read when its line on the Runs tab is opened. */
+export const useRoutineRunCalls = (orgId: string, id: string, runId: string | null) => {
+  const api = useApi();
+  return useQuery({
+    queryKey: keys.routineRunCalls(orgId, id, runId ?? ""),
+    queryFn: () => api.routines.runCalls(orgId, id, runId ?? ""),
+    enabled: Boolean(runId),
+    // What a run carried never changes.
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+};
+
 /** A webhook routine's address and latest calls (ADR 0106), for who manages it. */
 export const useRoutineHook = (orgId: string, id: string | null) => {
   const api = useApi();
@@ -5932,8 +5950,10 @@ export function useRoutineHookAction(orgId: string, id: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (
-      action: "address" | "secret" | "unsign" | "test" | "onAndTest",
+      action: "address" | "secret" | "unsign" | "test" | "onAndTest" | { paste: string },
     ): Promise<{ hook: RoutineHook; secret?: string; runId?: string | null }> => {
+      // The service's own secret: the person has it, so nothing is shown back.
+      if (typeof action === "object") return { hook: (await api.routines.newHookSecret(orgId, id, action.paste)).hook };
       if (action === "address") return { hook: await api.routines.newHookAddress(orgId, id) };
       if (action === "secret") return api.routines.newHookSecret(orgId, id);
       if (action === "unsign") return { hook: await api.routines.removeHookSecret(orgId, id) };
@@ -6381,12 +6401,17 @@ export function useSkillUsage(orgId: string, enabled: boolean) {
 type SkillChange =
   | {
       type: "import";
-      input: ({ url: string; list?: boolean; forAgentId?: string } | { zipBase64: string }) & {
+      input: (
+        | { url: string; list?: boolean; forAgentId?: string }
+        | { zipBase64: string }
+        | { fileId: string; list?: boolean; forAgentId?: string }
+      ) & {
         personal?: boolean;
       };
       upload?: UploadOptions;
     }
   | { type: "importPicked"; url: string; paths: string[]; forAgentId?: string; personal?: boolean }
+  | { type: "importPickedFile"; fileId: string; paths: string[]; forAgentId?: string; personal?: boolean }
   | { type: "importPickedZip"; zipBase64: string; paths: string[]; personal?: boolean; upload?: UploadOptions }
   | { type: "create"; input: SkillInput }
   | { type: "update"; id: string; patch: SkillPatch }
@@ -6410,6 +6435,8 @@ export function useSkillAction(orgId: string, { silent = false } = {}) {
           return api.skills.import(orgId, action.input, action.upload);
         case "importPicked":
           return api.skills.importPicked(orgId, action.url, action.paths, action.forAgentId, action.personal);
+        case "importPickedFile":
+          return api.skills.importPickedFile(orgId, action.fileId, action.paths, action.forAgentId, action.personal);
         case "importPickedZip":
           return api.skills.importPickedZip(orgId, action.zipBase64, action.paths, action.personal, action.upload);
         case "create":
@@ -6830,6 +6857,18 @@ export function useReduceMachineAccess(orgId: string) {
   });
 }
 
+/** No to a folder an agent waits for on a computer (`device.folder_request`): the inbox row it waited in is done. */
+export function useRefuseFolderRequest(orgId: string) {
+  const api = useApi();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ machineId, requestId }: { machineId: string; requestId: string }) =>
+      api.machines.refuseFolder(orgId, machineId, requestId),
+    meta: { silent: true },
+    onSuccess: () => void qc.invalidateQueries({ queryKey: keys.notifications(orgId) }),
+  });
+}
+
 /**
  * One click where a tool is off on a computer: its owner turns it on (`allow`), anyone else asks them (`ask`). The
  * machines and devices lists refetch so every screen that waited on it moves on.
@@ -6874,6 +6913,26 @@ export function useCheckMachineClis(orgId: string) {
     mutationFn: (machineId: string) => api.machines.checkClis(orgId, machineId),
     meta: { silent: true },
     onSettled: () => invalidateClis(qc, orgId),
+  });
+}
+
+/**
+ * "Try again" on a coding CLI the computer fetches by itself (ADR 0228 §6): its runner fetches the pinned build now;
+ * where it stands comes back and then live (`machine.updated` with `cliFetch`).
+ */
+export function useRetryCliFetch(orgId: string) {
+  const api = useApi();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ machineId, cli }: { machineId: string; cli: string }) =>
+      api.machines.fetchCli(orgId, machineId, cli),
+    onSuccess: (r, { machineId, cli }) => {
+      if (!r.fetch) return;
+      const fetch = r.fetch;
+      qc.setQueryData<Machine[]>(keys.machines(orgId), (old) =>
+        old?.map((m) => (m.id === machineId ? { ...m, cliFetch: { ...m.cliFetch, [cli]: fetch } } : m)),
+      );
+    },
   });
 }
 
@@ -8960,6 +9019,45 @@ export const useApps = (orgId: string, all = false, pollMs: number | false = fal
     refetchInterval: pollMs,
   });
 };
+
+/** Settings › Integrations (ADR 0251): the workspace's integration apps. */
+export const useIntegrationApps = (orgId: string, enabled = true) => {
+  const api = useApi();
+  return useQuery({
+    queryKey: keys.integrationApps(orgId),
+    queryFn: () => api.integrationApps.list(orgId),
+    enabled,
+  });
+};
+
+/** Make, change, rotate and remove integration apps; what shows once comes back in each answer. */
+export function useIntegrationAppActions(orgId: string) {
+  const api = useApi();
+  const qc = useQueryClient();
+  const done = () => void qc.invalidateQueries({ queryKey: keys.integrationApps(orgId) });
+  const silent = { meta: { silent: true }, onSuccess: done };
+  return {
+    create: useMutation({
+      mutationFn: (input: IntegrationAppInput) => api.integrationApps.create(orgId, input),
+      ...silent,
+    }),
+    update: useMutation({
+      mutationFn: (v: { appId: string; input: Partial<IntegrationAppInput> }) =>
+        api.integrationApps.update(orgId, v.appId, v.input),
+      ...silent,
+    }),
+    newToken: useMutation({ mutationFn: (appId: string) => api.integrationApps.newToken(orgId, appId), ...silent }),
+    revokeToken: useMutation({
+      mutationFn: (appId: string) => api.integrationApps.revokeToken(orgId, appId),
+      ...silent,
+    }),
+    newWebhookSecret: useMutation({
+      mutationFn: (appId: string) => api.integrationApps.newWebhookSecret(orgId, appId),
+      ...silent,
+    }),
+    remove: useMutation({ mutationFn: (appId: string) => api.integrationApps.remove(orgId, appId), ...silent }),
+  };
+}
 
 /** Desconectar an app, Revogar a token, Criar token: both lists refresh. */
 export function useAppActions(orgId: string) {

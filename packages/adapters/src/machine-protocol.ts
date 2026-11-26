@@ -7,7 +7,7 @@ import type { MergeDone } from "./command-policy";
  */
 
 /** Bumped on breaking changes; the server refuses runners older than `MIN_RUNNER_PROTOCOL`. */
-export const MACHINE_PROTOCOL_VERSION = 84;
+export const MACHINE_PROTOCOL_VERSION = 88;
 export const MIN_RUNNER_PROTOCOL = 1;
 /** From this protocol on, requests carry `agent` and each agent works in its own folder. */
 export const AGENT_FOLDERS_PROTOCOL = 2;
@@ -49,6 +49,13 @@ export const BRIDGE_PROTOCOL = 8;
 export const RUN_TOOL_TOKEN_PREFIX = "agr_";
 export const isRunToolToken = (v: unknown): v is string =>
   typeof v === "string" && v.length <= 100 && /^agr_[A-Za-z0-9_-]{20,96}$/.test(v);
+/** How the runner's refusals of a turn on Claude's own login for all agents begin (older runners end them otherwise). */
+export const SHARED_LOGIN_REFUSED = "This computer can't run this Claude sign-in";
+/** The runner's refusal while that login's switch is off on the computer or its self-check fails. */
+export const SHARED_LOGIN_OFF = `${SHARED_LOGIN_REFUSED} right now. Try again later, or remove it in AI accounts and connect Claude again.`;
+/** A computer brain's error that is such a refusal: the computer is online, its shared Claude login is what can't run. */
+export const sharedLoginRefused = (code: string, message: string) =>
+  code === "unsupported" && message.startsWith(SHARED_LOGIN_REFUSED);
 /**
  * From this protocol on, the runner runs conversational brain turns
  * (`brain.turn`, ADR 0032): Claude Code thinks for an agent on the machine,
@@ -329,6 +336,11 @@ export interface MachineLoad {
   diskFreeGb?: number;
   diskUse?: number;
   sharedGb?: number;
+  /**
+   * What the agents' temporary folders hold in memory now (GB), ADR 0243: system mode on Linux. Absent from an older
+   * runner: no protocol number, as `oomKills`.
+   */
+  agentTmpRamGb?: number;
 }
 
 /** How often a computer's load is sampled (protocol 22). */
@@ -1194,7 +1206,12 @@ export const isClaudeLoginMethod = (v: unknown): v is ClaudeLoginMethod => v ===
 export const claudeLoginMethodsOf = (said: readonly AuthMethod[] | undefined, system: boolean): AuthMethod[] =>
   said ? [...said] : [system ? "setup_token" : "cli_login"];
 
-/** Why a provider refused or failed a turn (protocol 50), as far as the runner could tell from the CLI. */
+/**
+ * Why a provider refused or failed a turn (protocol 50), as far as the runner could tell from the CLI.
+ * `model_unavailable`: the sign-in or its endpoint doesn't serve the model it was given (it doesn't exist there, or the
+ * account can't use it); `empty_answer`: the CLI ended its turn with nothing in it. A server that doesn't know a cause
+ * drops it (`isProviderFailureCause`), and the engine reads both from the CLI's words too (`withFailureCause`).
+ */
 export type ProviderFailureCause =
   | "auth_rejected"
   | "account_disabled"
@@ -1202,6 +1219,8 @@ export type ProviderFailureCause =
   | "billing"
   | "provider_transient"
   | "network"
+  | "model_unavailable"
+  | "empty_answer"
   | "unknown";
 export const PROVIDER_FAILURE_CAUSES: readonly ProviderFailureCause[] = [
   "auth_rejected",
@@ -1210,6 +1229,8 @@ export const PROVIDER_FAILURE_CAUSES: readonly ProviderFailureCause[] = [
   "billing",
   "provider_transient",
   "network",
+  "model_unavailable",
+  "empty_answer",
   "unknown",
 ];
 export const isProviderFailureCause = (v: unknown): v is ProviderFailureCause =>
@@ -2174,6 +2195,13 @@ export interface TaskStart {
 export const CLI_NAMES = ["claude", "codex", "cursor", "opencode", "grok", "antigravity"] as const;
 export type CliName = (typeof CLI_NAMES)[number];
 
+/**
+ * What a runner fetches by itself (ADR 0228 §6): the coding CLIs, and on Windows Git for Windows' portable build
+ * (`git`), whose bash is Claude Code's shell there.
+ */
+export const FETCH_NAMES = [...CLI_NAMES, "git"] as const;
+export type FetchName = (typeof FETCH_NAMES)[number];
+
 /** A coding CLI on the machine, as `hello` reports it (protocol 7). */
 export interface RunnerExecutorInfo {
   /** The line of `<cli> --version` that holds its version (else its first line, or `unknown`). */
@@ -2182,9 +2210,16 @@ export interface RunnerExecutorInfo {
   path?: string;
   /** `CODEX_UNELEVATED_PROTOCOL`, `codex` on Windows: what holds its commands there; absent until the runner knows. */
   sandbox?: CodexSandbox;
-  /** Protocol 8, `claude` only: `claude auth status` says it is logged in (absent: unknown). */
+  /**
+   * Protocol 8, `claude`: `claude auth status` says it is logged in (absent: unknown). `codex` (any protocol: an older
+   * runner leaves it out): its app-server's `account/read`, else `codex login status`, which is believed only on a
+   * sign-in it found.
+   */
   loggedIn?: boolean;
-  /** Protocol 8, `claude` only: how it is logged in (`claude.ai`, `api_key`…) and the plan (`pro`, `max`, `ultra`…). */
+  /**
+   * How it is logged in and the plan: `claude` (protocol 8) `claude.ai`, `api_key`… with `pro`, `max`, `ultra`…;
+   * `codex` `chatgpt` (with `plus`, `pro`, `team`…), `api_key`, or `provider` (a model provider of its own config).
+   */
   authMethod?: string;
   plan?: string;
   /**
@@ -2234,7 +2269,9 @@ export interface BrainTurnTimings {
  * fresh session the server started for an old one), or the end of the session's last process: idle past its limit,
  * closed for another conversation of the agent (its cap) or for memory, another launch asked (folder, permissions,
  * account, sign-in), a warm start with another system text, exited by itself, closed after its turn (canceled,
- * died, a background turn), or a session that ran before with no process left in this runner (it restarted).
+ * died, a background turn), or a session that ran before with no process left in this runner (it restarted). A warm
+ * start that came to nothing says why: started with another launch than its turn's (`warm_settings`), or asked before
+ * this runner ran a turn of the agent's, so with no system text to start it with (`no_launch`); `cap` too.
  */
 export const BRAIN_COLD_CAUSES = [
   "new_session",
@@ -2246,6 +2283,8 @@ export const BRAIN_COLD_CAUSES = [
   "exited",
   "closed",
   "restart",
+  "warm_settings",
+  "no_launch",
 ] as const;
 export type BrainColdCause = (typeof BRAIN_COLD_CAUSES)[number];
 
@@ -2567,7 +2606,7 @@ export const BRAIN_WARM_PROTOCOL = 74;
 export const TASK_LIMIT_PROTOCOL = 75;
 
 /**
- * Protocol 76 (ADR 0143): outside system mode the runner brings its own Antigravity CLI (`AGY_PIN`, at least that
+ * Protocol 76 (ADR 0143): outside system mode the runner brings its own Antigravity CLI (now one of `CLI_PINS`, at least that
  * version) where the person's is older or missing and Gemini thinks there, so a computer's Gemini models follow the
  * app's version. An older runner runs whatever `agy` the person installed.
  */
@@ -2620,6 +2659,18 @@ export const isEgressTarget = (v: unknown): v is { host: string; port: number } 
  */
 export const ANTIGRAVITY_WINDOWS_PROTOCOL = 84;
 
+/**
+ * Protocol 85 (ADR 0156): `AgentScope.coAuthors` lines are written `Co-Authored-By`. An older runner takes only
+ * `Co-authored-by` and would drop them, so the server sends it the old capitals (git and GitHub read either).
+ */
+export const CO_AUTHOR_CASE_PROTOCOL = 85;
+
+/**
+ * Protocol 87: `hello.app` says the agentes.chat app runs this runner (and updates it with its own releases, which lag
+ * this server's protocol). A runner from before says nothing either way.
+ */
+export const RUNNER_APP_PROTOCOL = 87;
+
 /** About how many more background tasks fit on the computer now, and what decides it. */
 export interface TaskRoomReport {
   more: number;
@@ -2634,6 +2685,48 @@ export interface TaskRoomReport {
 export function parseTaskRoom(v: unknown): TaskRoomReport | null {
   if (!isObject(v) || !inRange(v.more, [0, 1024]) || !between(v.freeGb, 0, 1 << 16)) return null;
   return { more: v.more, freeGb: v.freeGb, cpuBusy: v.cpuBusy === true, pushHarder: v.pushHarder === true };
+}
+
+/**
+ * Protocol 86 (ADR 0228 §6): one way to every coding CLI. The server sends its pin list after `welcome`
+ * (`clis.pins`, `@agenteschat/providers/cli-pins`); outside system mode the runner runs the person's own copy at the
+ * pinned version or newer, else fetches the pinned build on demand, checks its hash and runs that one, never touching
+ * the person's. `hello.clis` says which CLIs it can fetch on its system and where each fetch stands; `cli.fetch`
+ * frames report a fetch as it goes (at most once a second or every 5%); the `cli.fetch` op starts one again at once
+ * (the apps' "Try again"). An older runner brings only its Antigravity copy (`AGY_COPY_PROTOCOL`).
+ */
+export const CLI_COPIES_PROTOCOL = 86;
+
+/**
+ * Protocol 88: in system mode the CLIs are what every agent's user can start (`executors`, a CLI only root can start
+ * is `CLI_HOME_ONLY`), and the runner fetches the pinned build of one no agent reaches at all, root's and linked from
+ * `/usr/local/bin` (`hello.clis`, `cli.fetch`), which `cli.install` starts too (Claude Code, Codex). An older
+ * system-mode runner fetches nothing and installs nothing.
+ */
+export const AGENTS_CLI_PROTOCOL = 88;
+
+/** Why a fetch failed: no network, a download that isn't the vendor's build, no build for this system, a full disk. */
+export type CliFetchFailure = "offline" | "hash_mismatch" | "no_build" | "disk_full" | "failed";
+export const CLI_FETCH_FAILURES: readonly CliFetchFailure[] = [
+  "offline",
+  "hash_mismatch",
+  "no_build",
+  "disk_full",
+  "failed",
+];
+
+/** Where a runner's fetch of one CLI stands (`hello.clis.fetch`, the `cli.fetch` frame). `total`: null when unknown. */
+export type CliFetchState =
+  | { state: "fetching"; version: string; done: number; total: number | null }
+  | { state: "ready"; version: string }
+  | { state: "failed"; version: string; reason: CliFetchFailure };
+
+/** `hello.clis` (`CLI_COPIES_PROTOCOL`). */
+export interface RunnerClisInfo {
+  /** The CLIs this runner fetches by itself on this system (a pinned build for it, outside system mode). */
+  fetchable: FetchName[];
+  /** The last state of each fetch since the runner started. */
+  fetch: Partial<Record<FetchName, CliFetchState>>;
 }
 /** The tasks a computer may run at once (`maxConcurrentTasks` in the runner's config). */
 export const TASK_LIMIT_BOUNDS = [1, 20] as const;
@@ -2886,6 +2979,8 @@ export interface RunnerInfo {
      */
     broken?: Partial<Record<CliName, string>>;
   };
+  /** `CLI_COPIES_PROTOCOL`: which CLIs it fetches by itself, and where each fetch stands. */
+  clis?: RunnerClisInfo;
   /** Protocol 9: whether the owner paused this computer. */
   paused?: RunnerPause;
   /** Protocol 10: folders and tools allowed on the machine. */
@@ -2923,6 +3018,8 @@ export interface RunnerInfo {
   authEgressGroup?: true;
   /** `KEEP_RUNNING_PROTOCOL`: the holds that live here, and those that ended lately with why (the server may not know). */
   holds?: RunnerHolds;
+  /** `RUNNER_APP_PROTOCOL`: the agentes.chat app runs it; absent, a runner installed from the terminal. */
+  app?: true;
 }
 
 export interface RunnerHolds {
@@ -2950,7 +3047,7 @@ export interface AgentScope {
   /** Protocol 9: the agent's display name, for the machine's activity log. */
   name?: string;
   /**
-   * Protocol 63 (ADR 0156): on the work the server starts (`exec`, `brain.turn`, `task.start`), the `Co-authored-by`
+   * Protocol 63 (ADR 0156): on the work the server starts (`exec`, `brain.turn`, `task.start`), the `Co-Authored-By`
    * lines its commits end with. The runner hands them to git in the agent's own processes alone (`co-authors.ts`).
    */
   coAuthors?: string[];
@@ -3185,6 +3282,8 @@ export type MachineRequest = (
   | { op: "clis.check" }
   /** `CLI_INSTALL_PROTOCOL`: start an install of `tool`, or say where the last one stands, or stop it. One at a time. */
   | { op: "cli.install"; action: "start" | "status" | "cancel"; tool?: InstallableCli }
+  /** `CLI_COPIES_PROTOCOL`: fetch `cli`'s pinned build now, whatever an earlier failure said; answers at once. */
+  | { op: "cli.fetch"; cli: FetchName }
   /** `IPHONE_DEV_MODE_PROTOCOL`: open Xcode on this Mac (it shows Developer Mode on a plugged iPhone). */
   | { op: "xcode.open" }
   /** `PHONE_REPAIR_PROTOCOL`: repair the test helper of the iPhone `serial`; answers once its rebuild started. */
@@ -3274,6 +3373,7 @@ export const MACHINE_OPS: readonly MachineOp[] = [
   "xcode.fix",
   "clis.check",
   "cli.install",
+  "cli.fetch",
   "xcode.open",
   "phone.repair",
   "report.collect",
@@ -3450,6 +3550,8 @@ export interface MachineReplies {
   "xcode.fix": { fix: XcodeFix | null };
   "clis.check": { executors: NonNullable<RunnerInfo["executors"]> };
   "cli.install": { install: CliInstall | null };
+  /** Where its fetch stands now; null: the person's own copy serves, nothing to fetch. */
+  "cli.fetch": { fetch: CliFetchState | null };
   "xcode.open": { opened: boolean };
   "phone.repair": { repairing: boolean };
   "report.collect": RunnerReportParts;
@@ -3592,6 +3694,8 @@ export type ServerFrame =
    * runners ignore it.
    */
   | { type: "browser.handoff"; agentId: string; handoff: BrowserHandoffInfo | null }
+  /** `CLI_COPIES_PROTOCOL`: the server's pin list (`CliPins`), after each `welcome`; the runner checks it itself. */
+  | { type: "clis.pins"; pins: Record<string, unknown> }
   /** The server closes after sending this (bad token, revoked, outdated runner). */
   | { type: "refused"; reason: "invalid_token" | "revoked" | "outdated" | "replaced"; message: string };
 
@@ -3665,6 +3769,8 @@ export type RunnerFrame =
   | { type: "executors.changed"; executors: NonNullable<RunnerInfo["executors"]> }
   /** What `hello.toolchains` said changed (an Apple team found, Xcode updated), whole. An older server drops it. */
   | { type: "toolchains.changed"; toolchains: RunnerToolchains }
+  /** `CLI_COPIES_PROTOCOL`: a fetch of `cli` moved on (throttled), ended or failed. An older server drops it. */
+  | { type: "cli.fetch"; cli: FetchName; fetch: CliFetchState }
   /** `PHONES_PROTOCOL`: the phones it reaches changed (one came or went, a state or a holder changed), whole. */
   | { type: "phones.changed"; phones: RunnerPhone[] }
   /**
@@ -3933,13 +4039,41 @@ export function parseExecutors(v: Record<string, unknown>): NonNullable<RunnerIn
   return out;
 }
 
+/** A fetch's state as a runner reported it, checked; null when it isn't one. */
+export function parseCliFetchState(v: unknown): CliFetchState | null {
+  if (!isObject(v) || !isString(v.version)) return null;
+  const version = v.version.slice(0, 60);
+  if (v.state === "ready") return { state: "ready", version };
+  if (v.state === "failed") {
+    const reason = CLI_FETCH_FAILURES.find((r) => r === v.reason) ?? "failed";
+    return { state: "failed", version, reason };
+  }
+  if (v.state !== "fetching") return null;
+  const count = (x: unknown) => (typeof x === "number" && Number.isFinite(x) && x >= 0 ? Math.floor(x) : null);
+  const total = count(v.total);
+  return { state: "fetching", version, done: Math.min(count(v.done) ?? 0, total ?? Number.MAX_SAFE_INTEGER), total };
+}
+
+/** `hello.clis`, checked: known CLIs (and Git) only. */
+export function parseClis(v: Record<string, unknown>): RunnerClisInfo {
+  const fetchable = Array.isArray(v.fetchable) ? FETCH_NAMES.filter((n) => (v.fetchable as unknown[]).includes(n)) : [];
+  const fetch: RunnerClisInfo["fetch"] = {};
+  if (isObject(v.fetch)) {
+    for (const name of FETCH_NAMES) {
+      const state = parseCliFetchState(v.fetch[name]);
+      if (state) fetch[name] = state;
+    }
+  }
+  return { fetchable, fetch };
+}
+
 /** The longest error line `executors.broken` keeps for a CLI. */
 export const CLI_ERROR_MAX = 300;
 /** `executors.broken.claude` on Windows when Git for Windows, which Claude Code needs there, isn't on the computer. */
 export const CLI_GIT_MISSING = "git_missing";
 /**
- * `executors.broken.<cli>` in system mode for Cursor's, Grok Build or the Antigravity CLI found only in root's own
- * `~/.local/bin`, where its installer puts it and no agent's user can run it.
+ * `executors.broken.<cli>` in system mode for a CLI only root can start (one in root's own `~/.local/bin`, where its
+ * installer puts it, or anywhere else no agent's user can run it).
  */
 export const CLI_HOME_ONLY = "home_only";
 
@@ -4240,6 +4374,7 @@ export function parseRunnerFrame(raw: string): RunnerFrame | null {
         workspace: isString(f.workspace) ? f.workspace.slice(0, 500) : "",
         exec: f.exec !== false,
         ...(isObject(f.executors) ? { executors: parseExecutors(f.executors) } : {}),
+        ...(isObject(f.clis) ? { clis: parseClis(f.clis) } : {}),
         ...(Array.isArray(f.tasks)
           ? {
               tasks: f.tasks
@@ -4263,6 +4398,7 @@ export function parseRunnerFrame(raw: string): RunnerFrame | null {
           : {}),
         ...(isString(f.claudeLoginBlocked) ? { claudeLoginBlocked: f.claudeLoginBlocked.slice(0, 300) } : {}),
         ...(f.authEgressGroup === true ? { authEgressGroup: true as const } : {}),
+        ...(f.app === true ? { app: true as const } : {}),
         ...(Array.isArray(f.phones) ? { phones: parsePhones(f.phones) } : {}),
         ...(isObject(f.toolchains) ? { toolchains: parseToolchains(f.toolchains) } : {}),
         ...(isObject(f.holds) ? { holds: parseHolds(f.holds) } : {}),
@@ -4352,6 +4488,11 @@ export function parseRunnerFrame(raw: string): RunnerFrame | null {
       return isObject(f.executors) ? { type: "executors.changed", executors: parseExecutors(f.executors) } : null;
     case "toolchains.changed":
       return isObject(f.toolchains) ? { type: "toolchains.changed", toolchains: parseToolchains(f.toolchains) } : null;
+    case "cli.fetch": {
+      const cli = FETCH_NAMES.find((n) => n === f.cli);
+      const fetch = parseCliFetchState(f.fetch);
+      return cli && fetch ? { type: "cli.fetch", cli, fetch } : null;
+    }
     case "access.decided": {
       if (!isString(f.requestId)) return null;
       const decision = (["granted", "denied", "expired"] as const).find((d) => d === f.decision);
@@ -4501,6 +4642,7 @@ const SERVER_FRAME_TYPES = [
   "mcp.tools",
   "agents",
   "browser.handoff",
+  "clis.pins",
 ];
 
 /** Parses a server frame (runner side); null when it isn't one. */
@@ -4522,6 +4664,7 @@ export function parseServerFrame(raw: string): ServerFrame | null {
   if ((f.type === "mcp.result" || f.type === "mcp.tools") && !isString(f.callId)) return null;
   if (f.type === "mcp.tools" && f.ok === true && !Array.isArray(f.tools)) return null;
   if (f.type === "agents" && !Array.isArray(f.agents)) return null;
+  if (f.type === "clis.pins" && !isObject(f.pins)) return null;
   if (f.type === "browser.handoff" && (!isString(f.agentId) || (f.handoff !== null && !isObject(f.handoff)))) {
     return null;
   }
@@ -5038,6 +5181,7 @@ export function parseMachineLoad(v: unknown): MachineLoad | null {
     ...(between(v.diskFreeGb, 0, 1e6) ? { diskFreeGb: v.diskFreeGb } : {}),
     ...(between(v.diskUse, 0, 1) ? { diskUse: v.diskUse } : {}),
     ...(between(v.sharedGb, 0, 1e6) ? { sharedGb: v.sharedGb } : {}),
+    ...(between(v.agentTmpRamGb, 0, 1e6) ? { agentTmpRamGb: v.agentTmpRamGb } : {}),
   };
 }
 

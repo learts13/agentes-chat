@@ -87,6 +87,7 @@ export type ActivityKind =
   | "usingScreen"
   | "cloningRepo"
   | "listingRepos"
+  | "preparingCli"
   | "openingPullRequest"
   | "handingOff"
   | "recordingFindings"
@@ -146,6 +147,41 @@ export interface Activity {
   service?: string;
   /** A server connected by address: its own icon (`/api/app/connector-icons/…`). */
   icon?: string;
+  /** `preparingCli` (ADR 0228 §6): the computer its program is being fetched on, and how far (null: unknown yet). */
+  computer?: string;
+  percent?: number | null;
+}
+
+/** The coding CLIs' programs as people read them (`claude`, `codex`… as the server names them). */
+export const CLI_PROGRAMS: Readonly<Record<string, string>> = {
+  claude: "Claude Code",
+  codex: "Codex",
+  cursor: "Cursor",
+  opencode: "OpenCode",
+  grok: "Grok Build",
+  antigravity: "Antigravity",
+  // Git for Windows' portable build: Claude Code's shell on Windows (ADR 0228 §6).
+  git: "Git",
+};
+
+/** The CLI each computer brain thinks with. */
+export const CLI_OF_BRAIN: Readonly<Record<string, string>> = {
+  claude_code: "claude",
+  codex: "codex",
+  cursor: "cursor",
+  opencode: "opencode",
+  grok: "grok",
+  antigravity: "antigravity",
+};
+
+/** The tool a run's live line carries while its CLI is fetched on its computer (`<cli>|<computer>|<percent>`). */
+export const PREPARE_CLI_TOOL = "prepare_cli";
+
+/** "preparando o Claude Code no MacBook… 45%": the program, the computer and how far, from the line's detail. */
+function preparingOf(detail: string | null | undefined): Activity {
+  const [cli = "", computer = "", pct = ""] = (detail ?? "").split("|");
+  const percent = /^\d{1,3}$/.test(pct) ? Math.min(100, Number(pct)) : null;
+  return { kind: "preparingCli", app: CLI_PROGRAMS[cli] ?? cli, computer, percent };
 }
 
 /** Where a call works, as `agent.tool` and the saved `tool_call` step say it (the engine's `ToolDefinition`). */
@@ -231,6 +267,8 @@ const BUILTIN: Record<string, ActivityKind> = {
   cancel_reminder: "cancelingReminder",
   list_reminders: "listingReminders",
   list_routines: "listingRoutines",
+  // A webhook routine run reads the call that started it.
+  read_webhook_call: "listingRoutines",
   computer_status: "checkingComputer",
   wait_for_device: "waitingForDevice",
   create_wiki_page: "writingWiki",
@@ -433,6 +471,8 @@ function activityOf(tool: string | null | undefined, connector?: string | null, 
   }
   if (name === "load_skill")
     return detail?.trim() ? { kind: "openingSkill", app: detail.trim() } : { kind: "consultingSkill" };
+  // ADR 0228 §6: the run waits while its computer fetches the CLI it thinks with.
+  if (name === PREPARE_CLI_TOOL) return preparingOf(detail);
   // "Rodou: Rerun the tests": the command it checked, by the engine's label (`toolDetail`).
   if (name === PERMISSION_TOOL)
     return detail?.trim() ? { kind: "runningCommand", app: detail.trim() } : { kind: "runningCommandAny" };
@@ -697,7 +737,14 @@ export function barElapsed(t: TFunction, entries: ActivityEntry[], runs: LiveRun
 }
 
 /** "trabalhando", "consultando o GitHub". */
-export const activityVerb = (t: TFunction, a: Activity) => t(`chat.activity.${a.kind}`, { app: appLabel(a) });
+export const activityVerb = (t: TFunction, a: Activity) =>
+  a.kind === "preparingCli"
+    ? t(`chat.activity.${a.percent != null ? "preparingCliPct" : "preparingCli"}`, {
+        app: appLabel(a),
+        computer: a.computer ?? "",
+        percent: a.percent ?? 0,
+      })
+    : t(`chat.activity.${a.kind}`, { app: appLabel(a) });
 
 /**
  * The app as people read it: a connector's slug ("himetrica") starts with a capital ("Himetrica"); a name with
@@ -778,12 +825,18 @@ const WAIT_PHRASE = {
 } as const satisfies Record<ConsultationWait, string>;
 
 /**
- * One consultation's phrase: "Dev está perguntando ao Infra", "Infra respondeu. Dev está escrevendo". Work handed off
- * says the other agent's state: "Atlas lendo o Drive", "Atlas está trabalhando", "Atlas terminou. Ada está
- * escrevendo". Either way, what waits on the person reading ("Atlas espera sua aprovação") or on someone else ("O Atlas
- * espera uma aprovação") takes the phrase.
+ * One consultation's phrase: "Dev is asking Infra", "Infra answered. Dev is writing". Work handed off says the other
+ * agent's state: "Atlas reading the Drive", "Atlas helping Ada" (in the words of the reply that comes after it; `face`
+ * draws Ada's face before her name), "Atlas is done. Ada is writing". Either way, what waits on the person reading
+ * ("Atlas is waiting for your approval") or on someone else ("Atlas is waiting for an approval") takes the phrase.
  */
-function consultPhrase(t: TFunction, from: string, c: EntryConsult, mark: MarkName) {
+function consultPhrase(
+  t: TFunction,
+  from: { name: string; id: string },
+  c: EntryConsult,
+  mark: MarkName,
+  face?: MarkFace,
+) {
   const note = c.kind === "note";
   if (c.status === "asking") {
     if (c.yours)
@@ -791,16 +844,20 @@ function consultPhrase(t: TFunction, from: string, c: EntryConsult, mark: MarkNa
         name: mark(c.toName),
       });
     if (c.wait) return t(WAIT_PHRASE[c.wait], { name: mark(c.toName), context: agentGrammar(c.toName).context });
-    if (!note) return t("chat.consult.asking", { from: mark(from), to: mark(c.toName) });
+    if (!note) return t("chat.consult.asking", { from: mark(from.name), to: mark(c.toName) });
     return c.step
       ? t("chat.consult.doing", { name: mark(c.toName), doing: c.step })
-      : t("chat.consultGroup.working", { name: mark(c.toName) });
+      : t("chat.consult.helping", {
+          to: mark(c.toName),
+          from: face ? face(from.name, from.id) : mark(from.name),
+          context: agentGrammar(from.name).context,
+        });
   }
   if (c.status === "answered") {
-    return t(note ? "chat.consult.done" : "chat.consult.answered", { from: mark(from), to: mark(c.toName) });
+    return t(note ? "chat.consult.done" : "chat.consult.answered", { from: mark(from.name), to: mark(c.toName) });
   }
-  if (note) return t("chat.consult.notDone", { from: mark(from), to: mark(c.toName) });
-  return t("chat.consult.writing", { from: mark(from) });
+  if (note) return t("chat.consult.notDone", { from: mark(from.name), to: mark(c.toName) });
+  return t("chat.consult.writing", { from: mark(from.name) });
 }
 
 /**
@@ -825,10 +882,10 @@ const doingPhrase = (t: TFunction, names: string[], activity: Activity, mark: Ma
   t("chat.doing", { count: names.length, names: listNames(t, names, mark), doing: activityVerb(t, activity) });
 
 /** The agents' part: one says what it does (or whom it asks); several just work, their blocks say the rest. */
-function agentsPhrase(t: TFunction, entries: ActivityEntry[], mark: MarkName) {
+function agentsPhrase(t: TFunction, entries: ActivityEntry[], mark: MarkName, face?: MarkFace) {
   const agents = entries.filter((e) => e.type === "agent");
   const only = agents.length === 1 ? agents[0] : undefined;
-  if (only?.consult) return consultPhrase(t, only.name, only.consult, mark);
+  if (only?.consult) return consultPhrase(t, only, only.consult, mark, face);
   if (agents.length === 0) return "";
   const names = agents.map((e) => e.name);
   return doingPhrase(t, names, only?.activity ?? { kind: "thinking" }, mark);
@@ -840,9 +897,9 @@ const PHRASES_SEP = " · ";
  * The bar's sentence, one short line however many are at work: "Theo e mais 2 estão trabalhando · Marina
  * está digitando · Rui está gravando áudio…"; "" when nobody. `mark` wraps each name (for bold).
  */
-export function activitySentence(t: TFunction, entries: ActivityEntry[], mark: MarkName = plain) {
+export function activitySentence(t: TFunction, entries: ActivityEntry[], mark: MarkName = plain, face?: MarkFace) {
   const people = peopleGroups(entries).map((g) => doingPhrase(t, g.names, { kind: g.kind }, mark));
-  const phrases = [agentsPhrase(t, entries, mark), ...people].filter(Boolean);
+  const phrases = [agentsPhrase(t, entries, mark, face), ...people].filter(Boolean);
   return phrases.length > 0 ? `${phrases.join(PHRASES_SEP)}…` : "";
 }
 
@@ -854,10 +911,10 @@ export const activityText = (t: TFunction, entries: ActivityEntry[]) => activity
  * row's step line in the conversation (`waitStep`), never said twice. Anyone else (several, a question out, people
  * typing): the plain sentence.
  */
-export function barPhrase(t: TFunction, entries: ActivityEntry[], mark: MarkName = plain): string {
+export function barPhrase(t: TFunction, entries: ActivityEntry[], mark: MarkName = plain, face?: MarkFace): string {
   const only = entries.length === 1 ? entries[0] : undefined;
   if (only?.type === "agent" && !only.consult) return mark(only.name);
-  return activitySentence(t, entries, mark);
+  return activitySentence(t, entries, mark, face);
 }
 
 /** A group's phrase in two pieces, its names then what they do; a language that puts the names later keeps it whole. */
@@ -879,6 +936,7 @@ export function barWords(
   t: TFunction,
   entries: ActivityEntry[],
   mark: MarkName = plain,
+  face?: MarkFace,
 ): [
   agents: string,
   sep: string,
@@ -889,8 +947,8 @@ export function barWords(
   recording: string,
 ] {
   const groups = peopleGroups(entries);
-  if (groups.length === 0) return [barPhrase(t, entries, mark), "", "", "", "", "", ""];
-  const agents = agentsPhrase(t, entries, mark);
+  if (groups.length === 0) return [barPhrase(t, entries, mark, face), "", "", "", "", "", ""];
+  const agents = agentsPhrase(t, entries, mark, face);
   const typing = groups.find((g) => g.kind === "typing");
   const voice = groups.find((g) => g.kind === "recordingVoice");
   const [typers, typed] = typing ? namesFirst(t, typing.names, typing.kind, mark) : ["", ""];

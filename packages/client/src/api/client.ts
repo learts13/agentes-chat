@@ -15,9 +15,11 @@ import type { LiveApi } from "../live/api";
 import type { LiveRefInput } from "../live/types";
 import type {
   SecretToVaultInput,
+  VaultAccess,
   VaultConnectInput,
   VaultConnection,
   VaultConnectionPatch,
+  VaultImportInput,
   VaultImportResult,
   VaultItem,
   VaultItemDetail,
@@ -111,6 +113,7 @@ import type {
   ChannelOverride,
   Choices,
   ClientVitalsReport,
+  CliFetch,
   CliInstall,
   CodeSent,
   CommandApproval,
@@ -176,6 +179,9 @@ import type {
   ImportPlan,
   InstallableCli,
   Instance,
+  IntegrationApp,
+  IntegrationAppInput,
+  IntegrationAppSecrets,
   Invitation,
   InvitationPreview,
   InvitationState,
@@ -298,6 +304,7 @@ import type {
   RoutineInput,
   RoutinePatch,
   RoutineRun,
+  RoutineRunCall,
   RowHolders,
   RuleInfo,
   Run,
@@ -1333,8 +1340,12 @@ export interface ApiClient {
     allowTool(orgId: string, machineId: string, tool: MachineTool): Promise<MachineAccess>;
     /** Anyone else: asks whoever paired it to turn `tool` on (an inbox row with the same button). */
     askTool(orgId: string, machineId: string, tool: MachineTool): Promise<void>;
+    /** Admins or whoever paired it: no to a folder an agent waits for there (never a yes). The request's outcome. */
+    refuseFolder(orgId: string, machineId: string, requestId: string): Promise<{ status: string }>;
     /** Its PATH read again and its coding CLIs looked for now ("Já instalei, verificar de novo"). */
     checkClis(orgId: string, machineId: string): Promise<void>;
+    /** ADR 0228 §6: "Try again" on a CLI's fetch; where it stands now. */
+    fetchCli(orgId: string, machineId: string, cli: string): Promise<{ fetch: CliFetch | null }>;
     /** Only the person who paired it: installs `tool` there, or where that install stands, or stops it. */
     cliInstall(
       orgId: string,
@@ -1429,13 +1440,28 @@ export interface ApiClient {
      */
     import(
       orgId: string,
-      input: ({ url: string; list?: boolean; forAgentId?: string } | { zipBase64: string }) & { personal?: boolean },
+      input: (
+        | { url: string; list?: boolean; forAgentId?: string }
+        | { zipBase64: string }
+        | { fileId: string; list?: boolean; forAgentId?: string }
+      ) & { personal?: boolean },
       upload?: UploadOptions,
     ): Promise<SkillDetail | SkillPick>;
     /** Installs the skills picked among a link's choices (their `path`), on for `forAgentId` as `import` does. */
     importPicked(
       orgId: string,
       url: string,
+      paths: string[],
+      forAgentId?: string,
+      personal?: boolean,
+    ): Promise<SkillDetail[]>;
+    /**
+     * Installs the skills picked among the choices of a .zip sent in a conversation (`fileId`, a Drive file the card
+     * of `offer_install_skill` names), on for `forAgentId` as `import` does.
+     */
+    importPickedFile(
+      orgId: string,
+      fileId: string,
       paths: string[],
       forAgentId?: string,
       personal?: boolean,
@@ -1850,6 +1876,8 @@ export interface ApiClient {
     /** Continuar agora on a run paused near its plan's or budget's limit (`usagePause`): it goes on now. */
     continueUsage(orgId: string, id: string): Promise<Routine>;
     runs(orgId: string, id: string): Promise<RoutineRun[]>;
+    /** The calls a webhook routine's run carried, as kept (who manages it). */
+    runCalls(orgId: string, id: string, runId: string): Promise<RoutineRunCall[]>;
     /** A phrase → rule, its description, cron and next 5 runs. */
     parseRule(orgId: string, phrase: string, timezone?: string): Promise<RuleInfo>;
     /** A rule → its description, cron and next 5 runs (the picker's sentence). */
@@ -1864,8 +1892,8 @@ export interface ApiClient {
     hook(orgId: string, id: string): Promise<RoutineHook>;
     /** A new address: the old one stops at once. */
     newHookAddress(orgId: string, id: string): Promise<RoutineHook>;
-    /** A new signing secret, shown this once. */
-    newHookSecret(orgId: string, id: string): Promise<{ secret: string; hook: RoutineHook }>;
+    /** A new signing secret, shown this once; `pasted`: the service's own (Linear's) instead. */
+    newHookSecret(orgId: string, id: string, pasted?: string): Promise<{ secret: string; hook: RoutineHook }>;
     removeHookSecret(orgId: string, id: string): Promise<RoutineHook>;
     /** "Testar": a sample call; the agent is told it is a test. */
     testHook(orgId: string, id: string): Promise<{ runId: string | null; hook: RoutineHook }>;
@@ -2347,8 +2375,15 @@ export interface ApiClient {
     create(orgId: string, input: VaultItemInput): Promise<VaultItem>;
     update(orgId: string, itemId: string, patch: VaultItemPatch): Promise<VaultItem>;
     remove(orgId: string, itemId: string): Promise<void>;
-    /** A passwords file's text; `dryRun` only counts. 413 `vault.csv_too_large` past 2 MB. */
-    importCsv(orgId: string, input: { csv: string; scope: VaultScope; dryRun: boolean }): Promise<VaultImportResult>;
+    /** Many items at once: what this person may not change is left and counted in `kept`. */
+    setAccessMany(orgId: string, ids: string[], access: VaultAccess): Promise<{ changed: number; kept: number }>;
+    /** A password manager's items still in it are left too. */
+    removeMany(orgId: string, ids: string[]): Promise<{ deleted: number; kept: number }>;
+    /**
+     * A passwords file's text; `dryRun` only counts. `access` is the new logins' (absent: the scope's default). 413
+     * `vault.csv_too_large` past 2 MB.
+     */
+    importCsv(orgId: string, input: VaultImportInput): Promise<VaultImportResult>;
     /** Several keys in one save (an imported .env). 403 `vault.team_needs_permission` for the team's without it. */
     importKeys(orgId: string, input: VaultKeysImportInput): Promise<VaultKeysImportResult>;
     /**
@@ -2398,6 +2433,19 @@ export interface ApiClient {
     /** 409 `token_limit` past 10 live tokens per person here. */
     createToken(orgId: string, input: PersonalTokenInput): Promise<CreatedPersonalToken>;
     revokeToken(orgId: string, grantId: string): Promise<void>;
+  };
+  /**
+   * Integration apps (ADR 0251), for who may manage connectors: programs that post in chosen channels as themselves.
+   * A token (`agi_…`) and a webhook's signing secret show once, in the answer that made them.
+   */
+  integrationApps: {
+    list(orgId: string): Promise<IntegrationApp[]>;
+    create(orgId: string, input: IntegrationAppInput): Promise<IntegrationAppSecrets>;
+    update(orgId: string, appId: string, input: Partial<IntegrationAppInput>): Promise<IntegrationAppSecrets>;
+    newToken(orgId: string, appId: string): Promise<IntegrationAppSecrets>;
+    revokeToken(orgId: string, appId: string): Promise<IntegrationApp>;
+    newWebhookSecret(orgId: string, appId: string): Promise<IntegrationAppSecrets>;
+    remove(orgId: string, appId: string): Promise<void>;
   };
   /** "Lembrar": one-off reminders in conversations (also routines in Rotinas). */
   reminders?: {

@@ -106,6 +106,14 @@ describe("aiChoiceRows: one list for every picker", () => {
     ]);
   });
 
+  test("Lodi's A do workspace carries the workspace's default key, so its row says which it is", () => {
+    const target = { kind: "lodi", agentId: "l", scope: "mine" } as const;
+    const [withKey] = aiChoiceRows(hub([], [key("k1"), key("k2", { isDefault: true })]), ctx({ target }));
+    expect([withKey?.type, withKey?.apiKey?.id]).toEqual(["workspace", "k2"]);
+    const [noKey] = aiChoiceRows(hub([], [key("k1")]), ctx({ target }));
+    expect(noKey?.apiKey).toBeUndefined();
+  });
+
   test("the logins of one account are one row, the one thinking selected", () => {
     const h = hub([account("l1", { sameAs: "l1" }), account("l2", { sameAs: "l1" })]);
     const rows = aiChoiceRows(h, ctx({ current: { brain: "claude_code", account: "l2" } }));
@@ -192,7 +200,9 @@ describe("what a row chooses and saves", () => {
       ["auto", false],
       ["claude-a", true],
     ]);
-    expect(aiChoiceEfforts(k)).toEqual(["low", "medium", "high"]);
+    // A model the catalog doesn't list takes up to high; Claude 5.5's row lists every level.
+    expect(aiChoiceEfforts(k, "claude-a", [])).toEqual(["low", "medium", "high"]);
+    expect(aiChoiceEfforts(k, "claude-opus-5-5", [])).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 
   test("the current choice as each target's own view says it", () => {

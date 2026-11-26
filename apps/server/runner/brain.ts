@@ -81,8 +81,10 @@ import {
   stallNote,
   stallWords,
 } from "./brain-silence";
+import { withGitBash } from "./cli-install";
 import { coAuthorLines, commitAuthorEnv } from "./co-authors";
 import { ownBranches } from "./command-gate";
+import { ConsoleDecoder } from "./console-text";
 import { DELEGATED_RESULT_CHARS, type DelegatedBridge } from "./delegated-tools";
 import { hostMemAvailable, MIN_FREE_BYTES } from "./desktop-session";
 import { RunnerError } from "./errors";
@@ -102,7 +104,7 @@ import {
   redactDeep,
   turnAsks,
 } from "./mcp";
-import { isInside, resolveForAgent } from "./paths";
+import { isInside, resolveForAgent, runTmpEnv } from "./paths";
 import { resetIso } from "./plan-usage";
 import { claudeAtLeast, REPO_PLUGIN_MIN_CLAUDE, repoPlugin, repoPluginPrint } from "./repo-plugin";
 import type { Spawn } from "./scope-gate";
@@ -312,6 +314,12 @@ const NETWORK_TEXT =
   /\bE(?:CONNRESET|CONNREFUSED|CONNABORTED|TIMEDOUT|NOTFOUND|AI_AGAIN|HOSTUNREACH|NETUNREACH|PIPE)\b|socket hang up|proxy|connection error|fetch failed/i;
 /** How Claude Code words a provider's answer in an error text: "API Error: 403 {…}". */
 const API_ERROR_STATUS = /\bAPI Error: (\d{3})\b/;
+/**
+ * The model it was given isn't one the sign-in or its endpoint serves: Claude Code's "There's an issue with the selected
+ * model (…). It may not exist or you may not have access to it", the API's `not_found_error` on a model. Never its
+ * `unrecognized_model` notice, printed for a model outside its own catalog before it goes on.
+ */
+const MODEL_TEXT = /issue with the selected model|not_found_error.{0,40}model:|model[_ ]not[_ ]found/i;
 
 /** Why the provider refused or failed a call (protocol 50), and its HTTP status when the CLI said one. */
 export interface ProviderFailure {
@@ -336,6 +344,8 @@ export function providerFailure(f: {
   const http = httpStatus ? { httpStatus } : {};
   const error = typeof f.error === "string" ? f.error : "";
   if (DISABLED_TEXT.test(text)) return { cause: "account_disabled", ...http };
+  // Before the sign-in's refusal: a 403 on a model the account can't use is the model's, and another one may answer.
+  if (MODEL_TEXT.test(text)) return { cause: "model_unavailable", ...http };
   if (error === "authentication_failed" || error === "oauth_org_not_allowed" || status === 401 || status === 403)
     return { cause: "auth_rejected", ...http };
   if (error === "billing_error" || BILLING_TEXT.test(text)) return { cause: "billing", ...http };
@@ -535,6 +545,9 @@ export class ClaudeStreamParser {
   /** Each API call's whole input (cache included), by message id: the largest is the turn's biggest step. */
   private context = new Map<string, number>();
 
+  /** `now`: the clock its timings read (`stats`). */
+  constructor(private readonly now: () => number = Date.now) {}
+
   /** The calls of the main conversation (ours and its own) whose result hasn't come yet, oldest first. */
   inFlight(): InFlightTool[] {
     return [...this.tools.values()];
@@ -627,7 +640,7 @@ export class ClaudeStreamParser {
           this.streamedMessage = isObj(e.message) ? str(e.message.id) || null : null;
           const m = isObj(e.message) ? realModel(e.message.model) : "";
           if (m) this.turnModel = m;
-          this.stats.firstTokenAt ??= Date.now();
+          this.stats.firstTokenAt ??= this.now();
         }
         if (main && e.type === "content_block_delta" && delta.type === "text_delta" && str(delta.text)) {
           this.sawDelta = true;
@@ -651,7 +664,7 @@ export class ClaudeStreamParser {
           this.failure = {};
           const m = isObj(ev.message) ? realModel(ev.message.model) : "";
           if (m) this.turnModel = m;
-          this.stats.firstAssistantAt ??= Date.now();
+          this.stats.firstAssistantAt ??= this.now();
         }
         const messageId = isObj(ev.message) ? str(ev.message.id) : "";
         if (messageId && isObj(ev.message) && isObj(ev.message.usage)) {
@@ -1370,7 +1383,8 @@ export class ClaudeProcess {
     // the PATH (never in the agent's folder), a launcher through cmd.exe with every argument quoted (an empty
     // `--setting-sources` stays one).
     const run = cliSpawn(command.length ? command : ["claude"], args, envValue(env, "PATH"));
-    const runEnv = run.env ? { ...env, ...run.env } : env;
+    // On Windows its shell is Git Bash: the person's, else the runner's own (ADR 0228 §6).
+    const runEnv = withGitBash(run.env ? { ...env, ...run.env } : env);
     const timeouts = { ...runEnv, ...settingsEnv };
     const bashDefault = Number(timeouts.BASH_DEFAULT_TIMEOUT_MS);
     this.bashDefaultMs = Number.isFinite(bashDefault) && bashDefault > 0 ? bashDefault : BASH_DEFAULT_MS;
@@ -1414,9 +1428,9 @@ export class ClaudeProcess {
         else this.noteIdle(line);
       });
     }
-    this.child.stderr?.setEncoding("utf8");
-    this.child.stderr?.on("data", (chunk: string) => {
-      this.stderr = (this.stderr + chunk).slice(-STDERR_KEEP);
+    const decoder = new ConsoleDecoder();
+    this.child.stderr?.on("data", (chunk: Buffer) => {
+      this.stderr = (this.stderr + decoder.write(chunk)).slice(-STDERR_KEEP);
     });
   }
 
@@ -2115,6 +2129,9 @@ export interface BrainManagerOptions {
   log?: (line: string) => void;
 }
 
+/** A CLI process's own temp folder (`runTmpEnv`), gone with the process. */
+const brainTmpDir = (id: string) => path.join(os.tmpdir(), `agentes-run-${id}`);
+
 interface Live {
   key: string;
   agentId: string;
@@ -2667,9 +2684,13 @@ export class BrainManager {
   async prewarm(req: BrainWarmRequest, ctx: BrainTurnContext): Promise<BrainWarmReply> {
     const no: BrainWarmReply = { open: false, started: false };
     const system = this.systems.get(ctx.agent.id);
-    if (this.closed || req.kind !== "claude_code" || ctx.delegated || system === undefined) return no;
+    if (this.closed || req.kind !== "claude_code" || ctx.delegated) return no;
     const at = await this.place(req, ctx).catch(() => null);
     if (!at || "type" in at) return no;
+    if (system === undefined) {
+      this.noteGone(brainKey(ctx.agent.id, at.session), "no_launch");
+      return no;
+    }
     // The agent's folder asked: where its last turn ran instead (a checkout the engine moves its turns to), if still
     // one it may use.
     const last = this.cwds.get(ctx.agent.id);
@@ -2712,7 +2733,10 @@ export class BrainManager {
       if (this.closed) return no;
       if (this.alive(ctx.agent.id) >= this.max) {
         const idle = this.lruIdle(ctx.agent.id);
-        if (!idle) return no;
+        if (!idle) {
+          if (!this.live.has(key)) this.noteGone(key, "cap");
+          return no;
+        }
         this.closeIdle(idle, "for another conversation", "cap");
       }
       const resume = this.resumeFor(at.cwd, at.session, turn, at.ctx);
@@ -2813,6 +2837,7 @@ export class BrainManager {
       this.lastLaunch.set(ctx.agent.id, { req: launchOf(req), ctx, cwd });
     }
     let live = this.live.get(key);
+    const warmed = live?.warmed === true;
     if (live) live.warmed = false;
     // Warmed with another system text than this turn's: that text would be the session's for good.
     if (live?.guessed !== undefined) {
@@ -2832,7 +2857,7 @@ export class BrainManager {
     const repoChanged =
       live?.repoPrint !== undefined && !live.proc.holdsWork && repoPluginPrint(cwd) !== live.repoPrint;
     if (live && (live.proc.exited || live.sig !== sig || repoChanged || !(await this.switchLive(live, req, ctx)))) {
-      this.drop(live, live.proc.exited ? "exited" : "settings");
+      this.drop(live, live.proc.exited ? "exited" : warmed ? "warm_settings" : "settings");
       live = undefined;
     }
     // A turn of its own may have begun while it switched, and the runner may have begun to stop.
@@ -3180,6 +3205,7 @@ export class BrainManager {
       // Refused on the way (the worker went, a folder root won't build): no process will clean up after it.
       this.bridge.delete(id);
       rmSync(dir, { recursive: true, force: true });
+      rmSync(brainTmpDir(id), { recursive: true, force: true });
       throw err;
     }
   }
@@ -3254,6 +3280,7 @@ export class BrainManager {
     // where that folder is (single-user mode only, `withSharedBin`).
     if (!launched) {
       applySharedBin(env, this.opts.sharedFolder?.());
+      Object.assign(env, runTmpEnv(brainTmpDir(id)));
     }
     const keyPlan = ctx.planKey ? planOf(ctx.planKey.provider) : undefined;
     const plan = keyPlan && planForTurn(keyPlan, req.model);
@@ -3600,6 +3627,13 @@ export class BrainManager {
     return true;
   }
 
+  /** Why the session's next turn finds no process (its `cold`). */
+  private noteGone(key: string, cause: BrainColdCause) {
+    this.gone.delete(key);
+    this.gone.set(key, cause);
+    if (this.gone.size > GONE_KEPT) this.gone.delete(this.gone.keys().next().value ?? "");
+  }
+
   private drop(live: Live, cause: BrainColdCause = "closed") {
     // Once per process: a second pass at its exit would date the kept system text from the exit, not the close.
     if (live.dropped) return;
@@ -3608,9 +3642,7 @@ export class BrainManager {
     live.idleTimer = null;
     if (this.live.get(live.key) === live) {
       this.live.delete(live.key);
-      this.gone.delete(live.key);
-      this.gone.set(live.key, cause);
-      if (this.gone.size > GONE_KEPT) this.gone.delete(this.gone.keys().next().value ?? "");
+      this.noteGone(live.key, cause);
     }
     if (live.ready && this.ready.get(live.agentId) === live.key.slice(live.agentId.length + 1))
       this.ready.delete(live.agentId);
@@ -3626,7 +3658,10 @@ export class BrainManager {
       // nothing kept
     }
     // The process may still read its files while it exits.
-    const cleanup = () => rmSync(live.dir, { recursive: true, force: true });
+    const cleanup = () => {
+      rmSync(live.dir, { recursive: true, force: true });
+      rmSync(brainTmpDir(live.id), { recursive: true, force: true });
+    };
     if (live.proc.exited) cleanup();
     else live.proc.onExit(cleanup);
   }

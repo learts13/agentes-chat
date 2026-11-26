@@ -79,6 +79,7 @@ import {
   Textarea,
   Token,
   TokenList,
+  useMorph,
 } from "@agenteschat/ui";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -505,8 +506,11 @@ export function SetupCardView({
   children?: ReactNode;
 }) {
   const { t } = useTranslation();
+  // A row checked or a step added: the card glides to its new height.
+  const box = useRef<HTMLElement>(null);
+  useMorph(box);
   return (
-    <section className="setup-cl" aria-label={title} data-place={place}>
+    <section ref={box} className="setup-cl" aria-label={title} data-place={place}>
       <canvas ref={burstRef} className="setup-cl__burst" aria-hidden="true" tabIndex={-1} />
       {band}
       <div className="setup-cl__head">

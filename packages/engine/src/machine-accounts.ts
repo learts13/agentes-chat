@@ -11,6 +11,7 @@ import {
   type AuthMethod,
   accountCodeAad,
   CLAUDE_AUTH_PROTOCOL,
+  CLI_COPIES_PROTOCOL,
   type ClaudeLoginMethod,
   CURSOR_KEY_PROVIDER,
   CURSOR_PROTOCOL,
@@ -1566,7 +1567,7 @@ export async function beginAccountLogin(
   }
   const plan = planOf(provider);
   const { machine } = await memberMachine(deps.db, userId, orgId, machineId);
-  // A CLI its runner won't run on this system (Cursor on Windows) would sign in and fail every turn.
+  // A CLI its runner won't run on this system would sign in and fail every turn.
   if (!brainRunsOn(kind, machine.os)) {
     throw new ConflictError(`${BRAIN_NAMES[kind]} doesn't run on ${machine.name}'s system yet.`, "account.system", {
       program: BRAIN_NAMES[kind],
@@ -1589,7 +1590,9 @@ export async function beginAccountLogin(
     deps,
     machine,
     kind === "cursor"
-      ? CURSOR_PROTOCOL
+      ? machine.os === "windows"
+        ? CLI_COPIES_PROTOCOL
+        : CURSOR_PROTOCOL
       : kind === "antigravity"
         ? machine.os === "darwin"
           ? ANTIGRAVITY_MAC_PROTOCOL
@@ -1650,12 +1653,25 @@ export async function beginAccountLogin(
         ? kept
         : undefined
       : claudeAuthMethodFor(await claudeAuthPolicy(deps.db), orgId, system);
-    if (!again && method === "cli_login" && !claudeLoginMethodsOf(said, system).includes("cli_login")) {
-      throw new ConflictError(
-        "This computer can't connect Claude this way yet. Update the agentes.chat program on it, or use an API key.",
-        "account.method_unsupported",
-        { name: machine.name },
-      );
+    const offered = claudeLoginMethodsOf(said, system);
+    if (!again && method === "cli_login" && !offered.includes("cli_login")) {
+      if (!offered.includes("setup_token")) {
+        throw new ConflictError(
+          "This computer can't connect Claude this way yet. Update the agentes.chat program on it, or use an API key.",
+          "account.method_unsupported",
+          { name: machine.name },
+        );
+      }
+      // Not ready for it here yet (a self-check pending or failing, a runner from before): this one sign-in takes the
+      // token its runner makes, kept on its row, rather than stopping the person. Reported, so a computer that stays
+      // that way is seen.
+      method = "setup_token";
+      deps.log?.error("Claude sign-in used a setup token: the computer doesn't offer Claude's own login yet", {
+        orgId,
+        machineId: machine.id,
+        protocol,
+        reason: machine.executors?.claudeLoginBlocked ?? "pending",
+      });
     }
   }
   // How it signs in, where nothing else can happen: a key, or a CLI's own sign-in.

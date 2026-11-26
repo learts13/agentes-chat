@@ -21,9 +21,10 @@ import { steeredByOthers } from "../authority";
 import { isConfidentialRun, threadIsConfidential } from "../confidential";
 import { callLine, type LearnSignal, type RunCall, runCalls } from "../continuation";
 import { cutText, cutTextEnd } from "../format";
+import { ownTyped } from "../message-origin";
 import { enqueue } from "../outbox";
 import { runReadOutsideById } from "../outside";
-import { lineLocale, personBehindCall } from "../requester";
+import { lineLocale, personBehindCall, typedPersonBehindCall } from "../requester";
 import { isRightHand } from "../right-hand";
 import { lodiPrefsOf } from "../right-hand-prefs";
 import { addRunStep } from "../runs";
@@ -140,14 +141,14 @@ export const readsOutside = (c: RunCall) =>
   OUTSIDE_MARK.test(c.result?.content ?? "");
 
 /**
- * How far what a run learns is trusted (ADR 0120): high only with a person behind it (`personBehindCall`) and no
- * outside content read so far (the web, a page, mail, a connected app, a computer brain's own fetches, a screen, or
+ * How far what a run learns is trusted (ADR 0120): high only with a person behind it whose request they typed in our
+ * apps (`typedPersonBehindCall`, ADR 0250: not one posted with a token or bridged in) and no outside content read so far (the web, a page, mail, a connected app, a computer brain's own fetches, a screen, or
  * a conversation relaying any of these: `runReadOutside`, ADR 0117). Everything else stays low: data, never shared,
  * never promoted.
  */
 export async function learnTrust(ctx: Pick<ToolContext, "orgId" | "runId" | "triggerMessageId"> & { db: Database }) {
   const [person, calls, relayed] = await Promise.all([
-    personBehindCall(ctx),
+    typedPersonBehindCall(ctx),
     ctx.runId ? runCalls(ctx.db, { id: ctx.runId, orgId: ctx.orgId }) : Promise.resolve([] as RunCall[]),
     ctx.runId ? runReadOutsideById(ctx.db, ctx.orgId, ctx.runId) : Promise.resolve(false),
   ]);
@@ -203,10 +204,15 @@ export async function ownWords(
   const { trust, person } = await learnTrust(ctx);
   if (trust !== "high" || !person) return null;
   const [trigger] = await ctx.db
-    .select({ authorUserId: messages.authorUserId })
+    .select({
+      authorType: messages.authorType,
+      authorUserId: messages.authorUserId,
+      origin: messages.origin,
+      meta: messages.meta,
+    })
     .from(messages)
     .where(and(eq(messages.orgId, ctx.orgId), eq(messages.id, ctx.triggerMessageId)));
-  if (trigger?.authorUserId !== person) return null;
+  if (!trigger || !ownTyped(trigger) || trigger.authorUserId !== person) return null;
   const calls = await runCalls(ctx.db, { id: ctx.runId, orgId: ctx.orgId });
   if (calls.some((c) => OTHERS_WORDS.has(c.name))) return null;
   if (await readOthersInstructions(ctx.db, ctx.orgId, person, calls)) return null;
@@ -258,7 +264,8 @@ export async function afterTurnDone(
       ? input.signal !== undefined && input.signal !== "none"
       : fixedAfterFailing(calls, cfg.minToolCalls) || (repeatedTask(calls) && usedHowTos.length === 0);
     if (!learn) return false;
-    if ((await jobsToday(db, run.agentId)) >= cfg.maxPerAgentDay) return false;
+    // A person's correction is never crowded out by the day's other learning (a routine every 15 minutes).
+    if (input.signal !== "correction" && (await jobsToday(db, run.agentId)) >= cfg.maxPerAgentDay) return false;
     await enqueue(db, {
       orgId: run.orgId,
       kind: LEARN_JOB,
@@ -454,11 +461,14 @@ const ACTIVE = ["queued", "running", "waiting_approval", "waiting_input"] as con
  * with the agent, through the Model Gateway) reads the turn (its messages, its tool calls, its reply) and proposes
  * what to keep. Code decides the rest: refs must exist, trust comes from the run (`learnTrust`) and from the refs,
  * scopes beyond the agent's own need high trust (a person's also a message of theirs), and it only adds: an item a
- * person wrote is never replaced (both stay, disputed). Bounded per agent and day, skipped while the agent works
+ * person wrote is never replaced (both stay, disputed). Bounded per agent and day (a person's correction aside), skipped while the agent works
  * in the same conversation. Posts nothing; what a person told it is a quiet receipt with Undo, the rest none
  * (`learnedQuietly`).
  */
-export async function learnRun(deps: ContextDeps, input: { orgId: string; runId: string }): Promise<LearnResult> {
+export async function learnRun(
+  deps: ContextDeps,
+  input: { orgId: string; runId: string; signal?: string },
+): Promise<LearnResult> {
   const { db } = deps;
   const out: LearnResult = { saved: [], rejected: [], skills: [] };
   const cfg = learnConfig(deps);
@@ -515,7 +525,7 @@ export async function learnRun(deps: ContextDeps, input: { orgId: string; runId:
       set: { jobs: sql`${agentLearningDays.jobs} + 1` },
     })
     .returning({ jobs: agentLearningDays.jobs });
-  if ((day?.jobs ?? 0) > cfg.maxPerAgentDay) return { ...out, skipped: "cap_reached" };
+  if ((day?.jobs ?? 0) > cfg.maxPerAgentDay && input.signal !== "correction") return { ...out, skipped: "cap_reached" };
 
   const ctx = {
     db,
@@ -665,12 +675,12 @@ export async function learnRun(deps: ContextDeps, input: { orgId: string; runId:
     }
     if (cited.calls.some((c) => !readsOutside(c) && c.result && !c.result.isError))
       evidence.push({ type: "self", ref: run.id, agentId: agent.id, at: now });
-    // A person's preference only from a message of theirs, never inferred.
+    // A person's preference only from a message they typed themselves (`ownTyped`), never inferred.
     const person =
       item.scope === "person"
         ? (cited.messages.find(
             (m) =>
-              m.authorType === "person" &&
+              ownTyped(m) &&
               m.authorUserId &&
               (conversation.names.get(m.id) ?? "").toLowerCase() === item.about_person.trim().toLowerCase(),
           )?.authorUserId ?? null)

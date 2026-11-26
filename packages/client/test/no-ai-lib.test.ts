@@ -25,6 +25,7 @@ import {
   CLOUD_AWAY_MS,
   CLOUD_INSTALL_WAIT_MS,
   catchUp,
+  connectsPlanFor,
   defaultChoice,
   defaultTarget,
   dimmedLine,
@@ -33,6 +34,8 @@ import {
   gateDims,
   gateLine,
   gateRechecks,
+  HOST_CONNECT_WAIT_MS,
+  hostConnecting,
   isStandInLine,
   keptCardState,
   kindOf,
@@ -41,6 +44,7 @@ import {
   noAiCardOf,
   noAiCardShown,
   noAiLineKey,
+  noAiReceiptLine,
   noAiStatusKey,
   onlyOwnerReplies,
   ownSignInFor,
@@ -178,8 +182,15 @@ describe("planGate: what a plan's panel can do now", () => {
     expect(gate({ edition: null })).toEqual({ state: "loading" });
   });
 
-  test("an agent the viewer doesn't own, before anything about its computer", () => {
-    expect(gate({ brain: brain({ canUsePlans: false, computer: null }) })).toEqual({ state: "locked", who: "owner" });
+  test("an agent the viewer doesn't own and can't sign a plan in for, before anything about its computer", () => {
+    expect(gate({ brain: brain({ canUsePlans: false, canManageAccounts: false, computer: null }) })).toEqual({
+      state: "locked",
+      who: "owner",
+    });
+  });
+
+  test("someone else's agent that the viewer manages: a plan of their own signs in for it where they add accounts", () => {
+    expect(gate({ brain: brain({ canUsePlans: false }) })).toEqual({ state: "ready" });
   });
 
   test("self-host with no computer for the agent: missing", () => {
@@ -323,6 +334,17 @@ describe("the Cloud's plan gate tells the truth", () => {
     );
   });
 
+  test("a CLI at a version agentes.chat holds back: needs an update there, with its command where it has one", () => {
+    const where = { edition: "selfhost", computer: "Acme" } as const;
+    const gate = { state: "unsupported", reason: "cli_outdated" } as const;
+    expect(gateLine(enT, { gate, kind: "claude_code", ...where })?.text).toBe(
+      "Claude Code on Acme needs an update before agents can use it. Run claude update there.",
+    );
+    expect(gateLine(enT, { gate, kind: "codex", ...where })?.text).toBe(
+      "Codex on Acme needs an update before agents can use it.",
+    );
+  });
+
   test("a CLI missing from a computer ready just now may still be coming; past that it never reads as installing", () => {
     const soon = codexGate(CLOUD_INSTALL_WAIT_MS - 60_000);
     expect(soon).toEqual({ state: "unsupported", reason: "not_installed" });
@@ -432,6 +454,25 @@ describe("planGateWithoutAgent: a plan connected before its owner has any agent"
   test("a computer that never connected is offline, not a runner to update", () => {
     const paired = { ...MAC, online: false, canAdd: false };
     expect(at({ computers: [paired] })).toEqual({ gate: { state: "offline" }, computer: paired });
+  });
+});
+
+describe("hostConnecting: the server's own computer added with a new workspace", () => {
+  const NOW = Date.parse("2026-11-26T12:00:00Z");
+  const offline: PlanGate = { state: "offline" };
+  const host = { kind: "host" as const, lastSeenAt: null, createdAt: new Date(NOW - 10_000).toISOString() };
+
+  test("offline before its runner's first sync: connecting, not a computer to wait for or replace with a key", () => {
+    expect(hostConnecting(offline, host, NOW)).toBe(true);
+  });
+
+  test("only the server's own, never seen, and only while the runner's sync may still come", () => {
+    expect(hostConnecting({ state: "ready" }, host, NOW)).toBe(false);
+    expect(hostConnecting(offline, { ...host, kind: "connected" }, NOW)).toBe(false);
+    expect(hostConnecting(offline, { ...host, lastSeenAt: new Date(NOW - 60_000).toISOString() }, NOW)).toBe(false);
+    const old = { ...host, createdAt: new Date(NOW - HOST_CONNECT_WAIT_MS).toISOString() };
+    expect(hostConnecting(offline, old, NOW)).toBe(false);
+    expect(hostConnecting(offline, undefined, NOW)).toBe(false);
   });
 });
 
@@ -937,6 +978,19 @@ describe("a card says the real cause, not that the agent has no AI", () => {
   });
   const card = (reason: string, extra?: Record<string, unknown>) => noAiCardOf(meta(reason, extra));
 
+  test("Connect signs a plan in for the person's own agents, the right hand and the ones they manage; nobody else's", () => {
+    const joaos = { ownerUserId: "u-joao" };
+    expect(connectsPlanFor(joaos, "u-joao")).toBe(true);
+    // A workspace admin on João's agent: a plan of his own, lent to it, never "ask an admin".
+    expect(connectsPlanFor({ ...joaos, canManage: true }, "u-walter")).toBe(true);
+    // A plain member on João's agent: who connects it instead.
+    expect(connectsPlanFor({ ...joaos, canManage: false }, "u-bia")).toBe(false);
+    expect(connectsPlanFor(joaos, "u-bia")).toBe(false);
+    expect(connectsPlanFor({ ownerUserId: "u-joao", builtin: "right_hand" }, "u-bia")).toBe(true);
+    expect(connectsPlanFor(undefined, "u-bia")).toBe(false);
+    expect(connectsPlanFor(joaos, null)).toBe(false);
+  });
+
   test("Connect is for who can: the agent's owner, who manages it or keys, nobody else", () => {
     const agent = { ownerUserId: "u1" };
     expect(mayConnectAi(agent, "u1", { permissions: [] })).toBe(true);
@@ -1057,12 +1111,17 @@ describe("a card says the real cause, not that the agent has no AI", () => {
       expect(serverBody(pt, "…", wait(code))).toBe(
         "O Codex está desligado no meu computador. Respondo quando quem cuida dele ligar.",
       );
-    for (const code of ["runner_outdated", "codex_too_old"])
+    // Its CLI at a version agentes.chat holds back reads the same: a program there to update.
+    for (const code of ["runner_outdated", "codex_too_old", "cli_outdated"])
       expect(serverBody(pt, "…", wait(code))).toBe(
         "O programa no meu computador precisa ser atualizado para o Codex responder. Respondo assim que ele for atualizado.",
       );
     expect(serverBody(pt, "…", wait("plan_not_owner"))).toBe(
       "O Codex pensaria com um plano que não é do meu dono, então não uso. Conecte a conta do meu dono na minha página.",
+    );
+    // Its computer online, its shared Claude login refused there: what can't run, and the way out.
+    expect(serverBody(pt, "…", wait("shared_login_off"))).toBe(
+      "Meu computador não consegue usar o login do Claude para todos os agentes agora. Respondo assim que conseguir. Se continuar falhando, conecte o Claude de novo em Contas de IA.",
     );
     // Its computer gone still waits for it to come back.
     expect(serverBody(pt, "…", wait("machine_offline"))).toBe(
@@ -1166,5 +1225,36 @@ describe("a plan that doesn't run on the computer's system says so before it is 
     };
     const { gate: g } = planGateWithoutAgent({ choice: "gemini", edition: "selfhost", setup: null, computers: [pc] });
     expect(planOffSystem(enT, g)).toBe("Windows");
+  });
+});
+
+describe("noAiReceiptLine", () => {
+  const say = (why: Parameters<typeof noAiReceiptLine>[0]) => {
+    const line = noAiReceiptLine(why);
+    return line ? { text: enT(line.key, { name: "Lodi", model: line.model }), connect: line.connect } : null;
+  };
+
+  test("a plan it has that can't think there says why, with no Connect: another account wouldn't start it", () => {
+    expect(say({ code: "cli_failed" })).toEqual({
+      text: "Lodi can't answer now: the plan's AI stopped with an error.",
+      connect: false,
+    });
+    expect(say({ code: "plan_limit" })?.connect).toBe(false);
+    expect(say({ code: "model_limit", params: { model: "GPT-5.5" } })?.text).toContain("GPT-5.5");
+  });
+
+  test("a missing piece says which and keeps Connect; a plan that isn't this person's keeps Connect too", () => {
+    expect(say({ code: "cli_missing" })).toEqual({
+      text: enT("noAi.cliMissing", { name: "Lodi" }),
+      connect: true,
+    });
+    expect(say({ code: "plan_not_shared" })?.connect).toBe(true);
+  });
+
+  test("no AI at all, no reason, or one it can't word: the plain line", () => {
+    expect(noAiReceiptLine(undefined)).toBeNull();
+    expect(noAiReceiptLine({ code: "no_key" })).toBeNull();
+    expect(noAiReceiptLine({ code: "plans_not_yours" })).toBeNull();
+    expect(noAiReceiptLine({ code: "model_limit" })).toBeNull();
   });
 });

@@ -813,6 +813,7 @@
   },
   "agent": {
     "talk": "채팅",
+    "responsible": "담당자",
     "task": "작업",
     "owner": "소유자: {{name}}",
     "cantTalk": "이 에이전트는 나와 함께 일하지 않아요.",
@@ -2684,11 +2685,12 @@
     },
     "formatAuto": "{{name}}이(가) 가장 좋은 걸 골라요",
     "newWidget": {
-      "alerts": "알림 켜짐",
       "realData": "실제 데이터",
       "editAsk": "요청 바꾸기",
       "asked": "“{{ask}}”",
-      "autoFormat": "자동 형식"
+      "testReal": "실제 데이터로 테스트",
+      "addHome": "홈에 추가",
+      "addTo": "{{where}}에 추가"
     },
     "agentPick": {
       "search": "에이전트 검색",
@@ -3114,7 +3116,8 @@
       "workspaceSub": "워크스페이스 API 키",
       "key": "API 키",
       "keyDefault": "워크스페이스 기본값",
-      "api": "API"
+      "api": "API",
+      "asksMove": "{{agent}}은(는) 이 계정을 더 이상 쓰지 않아요."
     },
     "missionAi": "AI",
     "missionLocked": "작업할 주체는 시작 전에 고릅니다. 모델은 언제든 바꿀 수 있어요."

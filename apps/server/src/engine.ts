@@ -91,11 +91,13 @@ import {
   createToolGateway,
   createUsageToolSource,
   createVaultToolSource,
+  createWebhookCallToolSource,
   createWebToolSource,
   createWikiToolSource,
   createWithdrawRequestToolSource,
   createWorkspaceToolSource,
   createWorkToolSource,
+  deliverToApp,
   deviceWaitHooks,
   type EmailArt,
   emailArtAt,
@@ -107,12 +109,13 @@ import {
   GrokBrain,
   getAgentCached,
   hubBrainLink,
+  INTEGRATION_DELIVERY_JOB,
   type IntentWriter,
   isAgentesCloud,
-  isRightHand,
   type JobDeps,
   type Judge,
   type LiveDeps,
+  locksTurn,
   type MailDeps,
   type McpConnect,
   messageRouter,
@@ -120,6 +123,7 @@ import {
   notifyOwnerOnBudget,
   OpencodeBrain,
   officeLiveExporter,
+  outboundFetch,
   platformCapJudge,
   prepareAgentCode,
   publishUserEvent,
@@ -209,6 +213,8 @@ export interface EngineOptions {
   };
   /** Error reports (ADR 0104) for failures nothing logs: learning's (`reportLearnFailure`). */
   errors?: ErrorReporter;
+  /** Tests: where integration apps' webhooks are sent (default: `outboundFetch`). */
+  integrationFetch?: typeof fetch;
 }
 
 /**
@@ -500,6 +506,8 @@ export function buildEngine(o: EngineOptions) {
         tools: () => tools,
         gif: createAgentGifPoster(adapters.gifs),
       }),
+      // A webhook routine's run reads one of its calls whole: its text shortens long calls to fit.
+      createWebhookCallToolSource(),
       // Runs nobody called by name may stay quiet (reply-policy.ts): listed only for them.
       createPassToolSource(),
       createArtifactToolSource(artifacts),
@@ -722,8 +730,9 @@ export function buildEngine(o: EngineOptions) {
    * (ADR 0173); a mission's turn follows the mission's own setting.
    */
   const turnPermissions = async (turn: BrainTurn): Promise<BrainTurnRequest["permissions"]> =>
-    // The team's right hand on a plan: our tools and nothing else (ADR 0137 §4).
-    isRightHand(await getAgentCached(db, turn.orgId, turn.agentId))
+    // The team's right hand on a plan, and a run an app's message started: our tools and nothing else (ADR 0137 §4,
+    // ADR 0252).
+    (await locksTurn(db, await getAgentCached(db, turn.orgId, turn.agentId), turn))
       ? RIGHT_HAND_TURN
       : ((await missionTurnPermissions(db, turn)) ?? {
           mode: "work",
@@ -930,6 +939,12 @@ export function buildEngine(o: EngineOptions) {
     },
   };
   const handlers = createJobHandlers(jobDeps);
+  // An agent's reply where an integration app reads, to the app's webhook (ADR 0251), through the address-checking fetch.
+  const integrationDelivery = { db, keyWrappers, fetch: o.integrationFetch ?? outboundFetch() };
+  handlers[INTEGRATION_DELIVERY_JOB] = async (job) => {
+    if (!job.orgId) return;
+    await deliverToApp(integrationDelivery, job.orgId, String(job.payload.appId), String(job.payload.messageId));
+  };
   // A failing block of one of the right hand's lanes is left out of its prompt: it shows here.
   reportLodiLaneErrors((lane, error) => {
     o.log?.warn("right hand lane failed", { lane, error: String(error) });

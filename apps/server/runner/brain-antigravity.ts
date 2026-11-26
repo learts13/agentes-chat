@@ -20,10 +20,11 @@ import {
 import { AGY_CHAT_AGENT, prepareAgyHome } from "./agy-home";
 import { LIMIT_TEXT } from "./brain";
 import { type CodexBrainEvent, CodexThreads, chatFolder, codexProfileOf, codexThreadKey } from "./brain-codex";
-import { cursorPrompt } from "./brain-cursor";
+import { cursorPrompt, promptMaxOn } from "./brain-cursor";
+import { ConsoleDecoder } from "./console-text";
 import { RunnerError } from "./errors";
 import { killTree } from "./exec";
-import { AGY_BIN, resolveCommand } from "./executors";
+import { AGY_BIN, cliSpawn } from "./executors";
 import { CODEX_MCP_ENV, CODEX_MCP_SERVER, redactDeep } from "./mcp";
 import { resolveForAgent } from "./paths";
 import { resetFromWords } from "./plan-usage";
@@ -97,6 +98,16 @@ const OURS = new RegExp(`^(?:mcp[_.:/-]{1,2})?${CODEX_MCP_SERVER}(?:__|[_.:/-])[
 export const isOurAgyTool = (name: unknown) => typeof name === "string" && OURS.test(name);
 
 /**
+ * A tool step calling our MCP server: directly by name, or via Antigravity CLI 1.5.x's lazy MCP wrapper
+ * `call_mcp_tool` targeting our server alone (`parameters.ServerName === CODEX_MCP_SERVER`).
+ */
+export function isOurAgyToolCall(name: unknown, info?: Record<string, unknown> | null): boolean {
+  if (isOurAgyTool(name)) return true;
+  if (name !== "call_mcp_tool" || !info || !isRecord(info.parameters)) return false;
+  return info.parameters.ServerName === CODEX_MCP_SERVER;
+}
+
+/**
  * `--effort`: low, medium or high (`xhigh` and `max` as high: not every model has the extra level); a slug that names
  * its level (`…-high`, `…-xhigh`) takes none.
  */
@@ -131,14 +142,19 @@ export function antigravityTurnArgs(input: {
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
- * A `chat` turn's guard (protocol 44), line by line: `init` must list our server's tools alone, nothing may come
- * before it, and no step may be a tool that isn't ours or a subagent. Null when the line is fine.
+ * A `chat` turn's guard (protocol 44), line by line: `init` must either confirm our locked chat agent or list our
+ * server's tools alone, nothing may come before it, and no step may be a tool that isn't ours or a subagent. Null
+ * when the line is fine.
  */
 export function antigravityChatBreach(ev: Record<string, unknown>, sawInit: boolean): string | null {
   const stop = (why: string) => `${why}, so the turn stopped.`;
   if (ev.event === "init") {
-    const tools = isRecord(ev.init) ? ev.init.tools : undefined;
+    const init = isRecord(ev.init) ? ev.init : undefined;
+    const tools = init?.tools;
     if (!Array.isArray(tools)) return "The Antigravity CLI didn't list its tools, so the turn stopped before it began.";
+    // Antigravity CLI 1.5.x lists its static built-in catalog in `init.tools` even when `--agent agenteschat-chat`
+    // strips built-in tools from the prompt; require the locked agent name and keep guarding every tool step below.
+    if (init?.agent === AGY_CHAT_AGENT) return null;
     const theirs = tools.filter((t) => !isOurAgyTool(t)).map((t) => String(t).slice(0, 64));
     if (theirs.length === 0) return null;
     return `The Antigravity CLI offers tools of its own here (${theirs.slice(0, 8).join(", ")}), so the turn stopped before it could use them.`;
@@ -147,9 +163,9 @@ export function antigravityChatBreach(ev: Record<string, unknown>, sawInit: bool
   if (ev.event !== "step_update") return null;
   const step = isRecord(ev.step_update) ? ev.step_update : {};
   if (step.subagent_info !== undefined) return stop("The Antigravity CLI started another agent");
-  const info = isRecord(step.tool_info) ? step.tool_info : {};
-  const name = step.tool_name ?? info.name;
-  if ((step.step_type === "tool" || name !== undefined) && !isOurAgyTool(name)) {
+  const info = isRecord(step.tool_info) ? step.tool_info : null;
+  const name = step.tool_name ?? info?.name;
+  if ((step.step_type === "tool" || name !== undefined) && !isOurAgyToolCall(name, info)) {
     return stop(`The Antigravity CLI used a tool of its own (${String(name ?? "unknown").slice(0, 64)})`);
   }
   return null;
@@ -249,6 +265,8 @@ export interface AntigravityTurnOptions {
 export async function runAntigravityTurn(input: AntigravityTurnInput, opts: AntigravityTurnOptions): Promise<void> {
   const fail = (code: string, message: string, retryable?: boolean) =>
     opts.emit({ type: "error", code, message, ...(retryable ? { retryable } : {}) });
+  // Windows too, one Gemini account a computer there (ADR 0143 §3).
+  const platform = opts.platform ?? process.platform;
   try {
     prepareAgyHome(input.account.home, opts.mcpCommand);
     if (input.chat) {
@@ -272,7 +290,7 @@ export async function runAntigravityTurn(input: AntigravityTurnInput, opts: Anti
     ...(opts.socketPath ? { [CODEX_MCP_ENV[1]]: opts.socketPath } : {}),
     ...(opts.runnerHome ? { [CODEX_MCP_ENV[2]]: opts.runnerHome } : {}),
   };
-  const env = accountEnv("antigravity", input.account.home, base, opts.platform);
+  const env = accountEnv("antigravity", input.account.home, base, platform);
   const clean = (text: string) => (opts.redact ? opts.redact(text) : text);
   const hold = opts.redact ? (opts.redactHold ?? 0) : 0;
 
@@ -280,7 +298,7 @@ export async function runAntigravityTurn(input: AntigravityTurnInput, opts: Anti
   for (let attempt = 0; ; attempt++) {
     const chat = opts.chats.get(chatKey);
     const args = antigravityTurnArgs({
-      prompt: cursorPrompt(input.system, input.prompt, !chat),
+      prompt: cursorPrompt(input.system, input.prompt, !chat, promptMaxOn(platform)),
       ...(chat ? { chat } : {}),
       ...(input.model ? { model: input.model } : {}),
       ...(input.effort ? { effort: input.effort } : {}),
@@ -289,20 +307,23 @@ export async function runAntigravityTurn(input: AntigravityTurnInput, opts: Anti
     });
     let child: ChildProcess;
     try {
-      child = (opts.spawn ?? spawn)(resolveCommand(opts.bin ?? AGY_BIN, env.PATH), args, {
+      // Not its own group on Windows: there that opens a console, and `killTree` follows the tree anyway.
+      const run = cliSpawn([opts.bin ?? AGY_BIN], args, env.PATH, platform);
+      child = (opts.spawn ?? spawn)(run.file, run.args, {
         cwd: input.cwd,
-        env,
+        env: run.env ? { ...env, ...run.env } : env,
         stdio: ["ignore", "pipe", "pipe"],
-        // Its own process group (posix). On Windows that would open a console window of its own.
-        detached: (opts.platform ?? process.platform) !== "win32",
+        detached: platform !== "win32",
         windowsHide: true,
+        ...(run.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
       });
     } catch (err) {
       return fail("antigravity_failed", err instanceof Error ? err.message : String(err));
     }
     let stderr = "";
+    const stderrText = new ConsoleDecoder();
     child.stderr?.on("data", (c: Buffer) => {
-      stderr = (stderr + c.toString("utf8")).slice(-4000);
+      stderr = (stderr + stderrText.write(c)).slice(-4000);
     });
     let tail = "";
     let streamed = false;
@@ -374,7 +395,7 @@ export async function runAntigravityTurn(input: AntigravityTurnInput, opts: Anti
       const name = typeof step.tool_name === "string" ? step.tool_name : String(info.name ?? "tool");
       worked = true;
       // Our bridge's calls: the engine ran them.
-      if (isOurAgyTool(name)) return;
+      if (isOurAgyToolCall(name, info)) return;
       flush("", true);
       const error = isRecord(info.error) ? info.error : null;
       const output = error ? String(error.message ?? error.type ?? "failed") : String(info.output ?? "");

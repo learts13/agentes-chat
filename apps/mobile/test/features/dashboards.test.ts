@@ -603,6 +603,8 @@ describe("the widget card", () => {
     expect(bleedSeries(line, false)).toEqual([1, 2]);
     expect(bleedSeries(line, true)).toBeNull();
     expect(bleedSeries({ ...line, note: "up" }, false)).toBeNull();
+    // On the home's strip a line always runs along the foot: its last value and note stand above it.
+    expect(bleedSeries({ ...line, note: "up" }, false, true)).toEqual([1, 2]);
     expect(bleedSeries({ kind: "bars", labels: ["a"], values: [1] }, false)).toBeNull();
     expect(bleedSeries(null, false)).toBeNull();
   });
@@ -754,6 +756,29 @@ describe("one of many, on a pushed screen", () => {
     expect(widget).toContain("onPress: pickSchedule");
     expect(widget).not.toContain('open === "');
     expect(existsSync(join(import.meta.dir, "../../app/(app)/(main)/widget-edit/[id].tsx"))).toBe(true);
+  });
+
+  test("New widget: the card shows the widget, its settings are rows under it, the action at the page's foot", () => {
+    const create = src("dashboards/NewWidgetScreen.tsx");
+    // Nothing but the title and the ask in the card: no bell, no size switch, no footer of tiny picks.
+    expect(create).toContain("footer={null}");
+    expect(create).not.toContain('accessibilityRole="switch"');
+    expect(create).not.toContain("<PushedHeader");
+    for (const row of [
+      'label={t("dashboards.newWidget.who")}',
+      'label={t("dashboards.newWidget.format")}',
+      '<SizeRow key="size" value={sized} onChange={setSize} />',
+      'label={t("dashboards.newWidget.updates")}',
+      "toggle={alert}",
+      '<GroupedField key="condition" label={t("widgets.alert.condition")}>',
+    ])
+      expect(create).toContain(row);
+    expect(create).toContain('t("mobile.dashboards.newWidget.testReal")');
+    expect(create).toContain('t("mobile.dashboards.newWidget.addHome")');
+    // The home's strip ends on "Add" (who edits the board) beside "See all".
+    const strip = src("chats/HomeWidgets.tsx");
+    expect(strip).toMatch(/\{canAdd \? \(\s*<StripButton icon="plus" label=\{t\("widgets\.add\.word"\)\}/);
+    expect(strip).toContain('<StripButton icon="right" label={t("dashboards.seeAll")}');
   });
 
   test("a board's screens: no bare spinner, a way to retry, and the menu in the app's sheet", () => {

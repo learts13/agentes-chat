@@ -861,6 +861,7 @@
   },
   "agent": {
     "talk": "Chatear",
+    "responsible": "Responsable",
     "task": "Tarea",
     "owner": "responsable: {{name}}",
     "cantTalk": "Este agente no trabaja contigo.",
@@ -2915,11 +2916,12 @@
     },
     "formatAuto": "{{name}} elige el mejor",
     "newWidget": {
-      "alerts": "Avisa",
       "realData": "Datos reales",
       "editAsk": "Cambiar el pedido",
       "asked": "“{{ask}}”",
-      "autoFormat": "Formato automático"
+      "testReal": "Probar con datos reales",
+      "addHome": "Agregar a Inicio",
+      "addTo": "Agregar a {{where}}"
     },
     "agentPick": {
       "search": "Buscar agentes",
@@ -3377,7 +3379,8 @@
       "workspaceSub": "Clave de API del workspace",
       "key": "Clave de API",
       "keyDefault": "predeterminada del workspace",
-      "api": "API"
+      "api": "API",
+      "asksMove": "{{agent}} deja de usarla."
     },
     "missionAi": "IA",
     "missionLocked": "Quién hace el trabajo se elige antes de Iniciar. El modelo se puede cambiar en cualquier momento."
